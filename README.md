@@ -49,11 +49,4 @@ Campos principales (más en `message.py`):
 }
 ```
 
-## Siguientes pasos sugeridos
-- **Flooding**: reusar `forward_data` con registro de `msg_id` ya visto para evitar bucles.
-- **Distance Vector**: agregar tabla de distancias por vecino, periodicidad de envío y *poisoned reverse*.
-- **XMPP**: reemplazar `TCP sockets` por capa XMPP manteniendo la interfaz de `Node.send(msg)`.
-- **Métricas**: tiempos de `HELLO/PING`, histogramas de RTT y cambios de tabla.
 
----
-**Basado en el PDF del laboratorio (estructura y criterios).**
