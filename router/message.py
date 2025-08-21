@@ -6,7 +6,7 @@ from typing import Any, Dict
 @dataclass
 class Message:
     proto: str               # "dijkstra" | "flooding" | "lsr" | "dvr" | ...
-    type: str                # "hello" | "lsp" | "data" | "echo" | "info"
+    type: str                # "hello" | "lsp" | "data" | "echo" | "info" | "dv_announcement"
     src: str                 # nodo lógico (e.g., "A")
     dst: str                 # destino lógico (e.g., "D")
     ttl: int = 8
@@ -37,3 +37,20 @@ class Message:
             headers=o.get("headers",{}),
             payload=o.get("payload",{}),
         )
+
+# Constantes para tipos de protocolo
+class Protocol:
+    DIJKSTRA = "dijkstra"
+    DVR = "dvr"
+    FLOODING = "flooding"
+    LSR = "lsr"
+    SYSTEM = "sys"
+
+# Constantes para tipos de mensaje
+class MessageType:
+    HELLO = "hello"
+    ECHO = "echo"
+    LSP = "lsp"
+    DATA = "data"
+    INFO = "info"
+    DV_ANNOUNCEMENT = "dv_announcement"  # Nuevo tipo para DVR

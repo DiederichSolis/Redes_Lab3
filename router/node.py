@@ -9,11 +9,15 @@ import time
 from typing import Dict, Any, Set, Tuple
 
 try:
-    from .message import Message
+    from .message import Message, Protocol, MessageType
     from .dijkstra import dijkstra
+    from .dvr import DistanceVectorRouter
+    from .metrics import collector
 except Exception:
-    from message import Message
+    from message import Message, Protocol, MessageType
     from dijkstra import dijkstra
+    from dvr import DistanceVectorRouter
+    from metrics import collector
 
 BUF = 65535
 
@@ -28,11 +32,13 @@ class Node:
         bind_port: int,
         names: Dict[str, Dict[str, int]],
         neighbors: list[str],
+        routing_protocol: str = "lsr",  # "lsr" o "dvr"
     ) -> None:
         self.name = name
         self.host = bind_host
         self.port = bind_port
         self.addr = (bind_host, bind_port)
+        self.routing_protocol = routing_protocol
 
         # {"A":{"host":"127.0.0.1","port":56001}, ...}
         self.names: Dict[str, Dict[str, int]] = names
@@ -65,6 +71,17 @@ class Node:
         self.sock.bind(self.addr)
         self.sock.settimeout(0.5)
 
+        # Inicializar router DVR si es necesario
+        self.dvr_router = None
+        if self.routing_protocol == "dvr":
+            self.dvr_router = DistanceVectorRouter(self.name)
+            # Configurar enlaces directos iniciales
+            for v in self.neighbors:
+                self.dvr_router.update_direct_link(v, 1.0)
+
+        # Registrar protocolo para métricas
+        collector.register_protocol(self.routing_protocol, self.name)
+
     def start(self) -> None:
         self.t_listener = threading.Thread(target=self._listener, daemon=True)
         self.t_forward = threading.Thread(target=self._forwarding_loop, daemon=True)
@@ -93,12 +110,17 @@ class Node:
         addr = (cfg["host"], int(cfg["port"]))
         try:
             self.sock.sendto(json_str.encode("utf-8"), addr)
+            # Registrar métrica de mensaje enviado
+            collector.record_message(self.routing_protocol, "unknown", self.name, logical_name)
         except Exception as e:
             print(f"[{self.name}] ERROR sendto({logical_name} {addr}): {e}")
 
     def send(self, m: Message) -> None:
         """Envía el mensaje m según su protocolo y tabla de ruteo."""
-        if m.proto == "lsr" and m.type == "data":
+        # Registrar métrica de mensaje
+        collector.record_message(m.proto, m.type, m.src, m.dst)
+        
+        if m.proto == Protocol.LSR and m.type == MessageType.DATA:
             nh = self._next_hop_for(m.dst)
             if nh is None:
                 # Fallback: intenta enviar a todos los vecinos
@@ -107,6 +129,17 @@ class Node:
                 return
             self.send_raw(nh, m.to_json())
             return
+
+        if m.proto == Protocol.DVR and m.type == MessageType.DATA:
+            if self.dvr_router:
+                nh = self.dvr_router.get_next_hop(m.dst)
+                if nh is None:
+                    # Fallback: intenta enviar a todos los vecinos
+                    for v in self.neighbors:
+                        self.send_raw(v, m.to_json())
+                    return
+                self.send_raw(nh, m.to_json())
+                return
 
         # Si 'to' es vecino, envía directo. Si no, broadcast de cortesía.
         if m.dst in self.neighbors:
@@ -154,12 +187,12 @@ class Node:
             m.ttl -= 1
 
             # --- HELLO/ECHO (liveness/RTT simple) ---
-            if m.type == "hello":
+            if m.type == MessageType.HELLO:
                 # responde con echo si soy destino
                 if m.dst == self.name:
                     echo = Message(
-                        proto=m.proto or "sys",
-                        type="echo",
+                        proto=m.proto or Protocol.SYSTEM,
+                        type=MessageType.ECHO,
                         src=self.name,
                         dst=m.src,
                         ttl=8,
@@ -168,17 +201,34 @@ class Node:
                     )
                     # echo va directo al origen 
                     self.send(echo)
+                    # Registrar métrica de hello/echo
+                    collector.record_message(m.proto or Protocol.SYSTEM, MessageType.HELLO, m.src, m.dst)
                 continue
 
-            if m.type == "echo" and m.dst == self.name:
+            if m.type == MessageType.ECHO and m.dst == self.name:
                 t0 = float(m.headers.get("t0", 0.0))
                 rtt_ms = max(0.0, (time.time() - t0) * 1000.0)
                 self.neighbor_rtt_ms[m.src] = rtt_ms
                 # self._set_link_cost(self.name, m.src, max(1.0, rtt_ms / 50.0)) # actualiza costo del enlace
+                # Registrar métrica de echo
+                collector.record_message(m.proto or Protocol.SYSTEM, MessageType.ECHO, m.src, m.dst)
+                continue
+
+            # --- DVR: Distance Vector Announcements ---
+            if m.proto == Protocol.DVR and m.type == MessageType.DV_ANNOUNCEMENT:
+                if self.dvr_router:
+                    distances = m.payload.get("distances", {})
+                    self.dvr_router.receive_announcement(m.src, distances)
+                    print(f"[{self.name}] DVR: Recibido anuncio de {m.src}: {distances}")
+                    # Registrar métrica de mensaje recibido
+                    collector.record_message(m.proto, m.type, m.src, m.dst)
                 continue
 
             # --- LSR: LSP reception/flood ---
-            if m.proto == "lsr" and m.type == "lsp":
+            if m.proto == Protocol.LSR and m.type == MessageType.LSP:
+                # Registrar métrica de LSP recibido
+                collector.record_message(Protocol.LSR, MessageType.LSP, m.src, m.dst)
+                
                 lsp: Dict[str, Any] = m.payload or {}
                 lsp_id = str(lsp.get("id", ""))
                 node = str(lsp.get("node", ""))
@@ -200,8 +250,8 @@ class Node:
                     if v == came_from:
                         continue
                     fwd = Message(
-                        proto="lsr",
-                        type="lsp",
+                        proto=Protocol.LSR,
+                        type=MessageType.LSP,
                         src=self.name,
                         dst=v,
                         ttl=m.ttl,
@@ -209,10 +259,15 @@ class Node:
                         payload=lsp,
                     )
                     self.send_raw(v, fwd.to_json())
+                    # Registrar métrica de LSP reenviado
+                    collector.record_message(Protocol.LSR, MessageType.LSP, self.name, v)
                 continue
 
             # --- FLOODING: DATA ---
-            if m.proto == "flooding" and m.type == "data":
+            if m.proto == Protocol.FLOODING and m.type == MessageType.DATA:
+                # Registrar métrica de flooding recibido
+                collector.record_message(Protocol.FLOODING, MessageType.DATA, m.src, m.dst)
+                
                 msg_id = str(m.headers.get("id", ""))
                 came_from = m.headers.get("came_from")
                 if not msg_id:
@@ -232,8 +287,8 @@ class Node:
                     if v == came_from:
                         continue
                     fwd = Message(
-                        proto="flooding",
-                        type="data",
+                        proto=Protocol.FLOODING,
+                        type=MessageType.DATA,
                         src=self.name,
                         dst=m.dst,
                         ttl=m.ttl,
@@ -241,10 +296,15 @@ class Node:
                         payload=m.payload,
                     )
                     self.send_raw(v, fwd.to_json())
+                    # Registrar métrica de flooding
+                    collector.record_message(Protocol.FLOODING, MessageType.DATA, self.name, v)
                 continue
 
             # --- DATA (LSR u otros) ---
-            if m.type == "data":
+            if m.type == MessageType.DATA:
+                # Registrar métrica de data recibido
+                collector.record_message(m.proto, MessageType.DATA, m.src, m.dst)
+                
                 if m.dst == self.name:
                     self._deliver(m)
                 else:
@@ -252,17 +312,20 @@ class Node:
                 continue
 
             # --- INFO u otros ---
-            if m.type == "info" and m.dst == self.name:
+            if m.type == MessageType.INFO and m.dst == self.name:
                 print(f"[{self.name}] INFO: {m.payload}")
+                # Registrar métrica de info
+                collector.record_message(m.proto, MessageType.INFO, m.src, m.dst)
                 continue
 
     # ---------------- routing (Dijkstra + LSP emit) ----------------
     def _routing_loop(self) -> None:
         """
         1) Recalcula la tabla de ruteo periódicamente.
-        2) Emite cada unos segundos un LSP con sus enlaces actuales.
+        2) Emite cada unos segundos un LSP con sus enlaces actuales (LSR) o anuncio DVR.
         """
         next_lsp_at = 0.0
+        next_dv_at = 0.0
         while not self.stop_event.is_set():
             now = time.time()
 
@@ -273,13 +336,20 @@ class Node:
             for v in list(self.neighbors):
                 self.graph.setdefault(self.name, {}).setdefault(v, 1.0)
 
-            # Recalcular rutas
-            self._recompute_routes()
-
-            # Emitir LSP cada 3s (simple)
-            if now >= next_lsp_at:
-                self._emit_lsp()
-                next_lsp_at = now + 3.0
+            # Recalcular rutas según el protocolo
+            if self.routing_protocol == "lsr":
+                self._update_routing_table()
+                # Emitir LSP cada 3s (simple)
+                if now >= next_lsp_at:
+                    self._emit_lsp()
+                    next_lsp_at = now + 3.0
+            elif self.routing_protocol == "dvr":
+                # Actualizar tabla de enrutamiento desde DVR
+                self._update_routing_table()
+                # Emitir anuncios DVR cada 2s
+                if now >= next_dv_at:
+                    self._emit_dv_announcement()
+                    next_dv_at = now + 2.0
 
             time.sleep(1.0)
 
@@ -307,6 +377,14 @@ class Node:
             if nh:
                 table[dest] = nh
         self.routing_table = table
+
+    def _update_routing_table(self) -> None:
+        """Actualiza la tabla de enrutamiento según el protocolo configurado."""
+        if self.routing_protocol == "lsr":
+            self._recompute_routes()
+        elif self.routing_protocol == "dvr" and self.dvr_router:
+            # Para DVR, la tabla se actualiza automáticamente en el router DVR
+            self.routing_table = self.dvr_router.get_routing_table()
 
     @staticmethod
     def _first_hop_from_prev(prev: Dict[str, str | None], dest: str) -> str | None:
@@ -340,8 +418,8 @@ class Node:
         }
         for v in list(self.neighbors):
             m = Message(
-                proto="lsr",
-                type="lsp",
+                proto=Protocol.LSR,
+                type=MessageType.LSP,
                 src=self.name,
                 dst=v,
                 ttl=8,
@@ -349,6 +427,36 @@ class Node:
                 payload=lsp,
             )
             self.send_raw(v, m.to_json())
+            # Registrar métrica de LSP enviado
+            collector.record_message(Protocol.LSR, MessageType.LSP, self.name, v)
+
+    def _emit_dv_announcement(self) -> None:
+        """Emite anuncio de distancias DVR a todos los vecinos."""
+        if not self.dvr_router:
+            return
+            
+        # Obtener tabla de distancias actual
+        distances = self.dvr_router.announce_distances()
+        
+        # Agregar enlaces directos
+        for neighbor in self.neighbors:
+            distances[neighbor] = 1.0  # Costo directo
+            
+        # Enviar anuncio a todos los vecinos
+        for v in list(self.neighbors):
+            m = Message(
+                proto=Protocol.DVR,
+                type=MessageType.DV_ANNOUNCEMENT,
+                src=self.name,
+                dst=v,
+                ttl=8,
+                headers={},
+                payload={"distances": distances},
+            )
+            self.send_raw(v, m.to_json())
+            # Registrar métrica de anuncio DVR enviado
+            collector.record_message(Protocol.DVR, MessageType.DV_ANNOUNCEMENT, self.name, v)
+            print(f"[{self.name}] DVR: Enviando anuncio a {v}: {distances}")
 
     # ---------------- HELLO loop ----------------
     def _hello_loop(self) -> None:
@@ -357,8 +465,8 @@ class Node:
             t0 = time.time()
             for v in list(self.neighbors):
                 hello = Message(
-                    proto="sys",
-                    type="hello",
+                    proto=Protocol.SYSTEM,
+                    type=MessageType.HELLO,
                     src=self.name,
                     dst=v,
                     ttl=4,
@@ -366,6 +474,8 @@ class Node:
                     payload={},
                 )
                 self.send(hello)
+                # Registrar métrica de hello enviado
+                collector.record_message(Protocol.SYSTEM, MessageType.HELLO, self.name, v)
             time.sleep(2.0)
 
     # ---------------- utils de entrega/usuario ----------------
@@ -374,16 +484,19 @@ class Node:
         print(f"[{self.name}] DATA entregado de {m.src} → {m.dst} | payload={json.dumps(m.payload, ensure_ascii=False)}")
 
     def send_data(self, dst: str, text: str, ttl: int = 12) -> None:
-        """Envío de DATA de usuario usando LSR (tabla de ruteo)."""
-        m = Message(proto="lsr", type="data", src=self.name, dst=dst, ttl=ttl, payload={"text": text})
+        """Envío de DATA de usuario usando el protocolo configurado."""
+        proto = Protocol.DVR if self.routing_protocol == "dvr" else Protocol.LSR
+        m = Message(proto=proto, type=MessageType.DATA, src=self.name, dst=dst, ttl=ttl, payload={"text": text})
+        # Registrar métrica de data enviado
+        collector.record_message(proto, MessageType.DATA, self.name, dst)
         self.send(m)
 
     def send_data_flood(self, dst: str, text: str, ttl: int = 12) -> None:
         """Envío de DATA de usuario usando Flooding 'standalone' con supresión de duplicados."""
         msg_id = f"{self.name}-{int(time.time() * 1000)}-{random.randint(0, 9999)}"
         m = Message(
-            proto="flooding",
-            type="data",
+            proto=Protocol.FLOODING,
+            type=MessageType.DATA,
             src=self.name,
             dst=dst,
             ttl=ttl,
@@ -393,6 +506,15 @@ class Node:
         # Sale a todos los vecinos (primer inundación)
         for v in list(self.neighbors):
             self.send_raw(v, m.to_json())
+            # Registrar métrica de flooding enviado
+            collector.record_message(Protocol.FLOODING, MessageType.DATA, self.name, v)
+
+    def send_data_dvr(self, dst: str, text: str, ttl: int = 12) -> None:
+        """Envío de DATA específicamente usando DVR."""
+        m = Message(proto=Protocol.DVR, type=MessageType.DATA, src=self.name, dst=dst, ttl=ttl, payload={"text": text})
+        # Registrar métrica de data DVR enviado
+        collector.record_message(Protocol.DVR, MessageType.DATA, self.name, dst)
+        self.send(m)
 
     # ---------------- helpers opcionales ----------------
     def _set_link_cost(self, u: str, v: str, cost: float) -> None:

@@ -11,12 +11,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from router.node import Node  # node.py está en router/
+from router.metrics import collector
 
 # ---------- Imports estándar ----------
 import argparse
 import json
 import signal
 import time
+import threading
 from typing import Dict, List
 
 
@@ -87,7 +89,7 @@ def load_topo(path: str) -> Dict[str, List[str]]:
 
 
 # ---------- Construcción / control de nodos ----------
-def build_nodes(names: Dict[str, Dict[str, int]], topo: Dict[str, List[str]]) -> Dict[str, Node]:
+def build_nodes(names: Dict[str, Dict[str, int]], topo: Dict[str, List[str]], protocol: str = "lsr") -> Dict[str, Node]:
     nodes: Dict[str, Node] = {}
     # Asegura que todos los que están en names existan en topo (aunque sea con lista vacía)
     for n in names.keys():
@@ -103,6 +105,7 @@ def build_nodes(names: Dict[str, Dict[str, int]], topo: Dict[str, List[str]]) ->
             bind_port=port,
             names=names,
             neighbors=neighbors,
+            routing_protocol=protocol
         )
     return nodes
 
@@ -120,10 +123,11 @@ def stop_nodes(nodes: Dict[str, Node]) -> None:
 
 
 def print_tables(nodes: Dict[str, Node]) -> None:
-    print("\n[demo] Tablas de ruteo actuales (LSR):")
+    print("\n[demo] Tablas de ruteo actuales:")
     for name in sorted(nodes.keys()):
         rt = getattr(nodes[name], "routing_table", {})
-        print(f"  - {name}: {rt}")
+        protocol = getattr(nodes[name], "routing_protocol", "unknown").upper()
+        print(f"  - {name} ({protocol}): {rt}")
 
 
 # ---------- Envío de mensaje de prueba ----------
@@ -153,6 +157,25 @@ def demo_send(
 def handle_sigint(nodes: Dict[str, Node]):
     def _handler(_sig, _frm):
         print("\n[demo] SIGINT recibido. Deteniendo nodos…")
+        
+        # Mostrar métricas finales si están disponibles
+        try:
+            collector.print_summary()
+            
+            # Generar reporte
+            timestamp = int(time.time())
+            report = collector.get_comparison_report()
+            report_file = f"demo_metrics_{timestamp}.json"
+            
+            try:
+                with open(report_file, "w", encoding="utf-8") as f:
+                    json.dump(report, f, indent=2, ensure_ascii=False)
+                print(f"[demo] 💾 Métricas guardadas: {report_file}")
+            except Exception as e:
+                print(f"[demo] ❌ Error guardando métricas: {e}")
+        except Exception as e:
+            print(f"[demo] No se pudieron generar métricas: {e}")
+        
         stop_nodes(nodes)
         sys.exit(0)
 
@@ -161,48 +184,151 @@ def handle_sigint(nodes: Dict[str, Node]):
 
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser(description="Run demo Lab 3 - Parte 1 (sockets locales)")
+    parser = argparse.ArgumentParser(description="Run demo Lab 3 - Routing Protocols Comparison")
     parser.add_argument("--names", default="names-sample.json", help="Ruta a archivo JSON de nombres (host/port)")
     parser.add_argument("--topo", default="topo-sample.json", help="Ruta a archivo JSON de topología")
-    parser.add_argument("--algo", choices=["lsr", "flooding"], default="lsr", help="Algoritmo para DATA")
+    parser.add_argument("--algo", choices=["lsr", "dvr", "flooding"], default="lsr", help="Algoritmo para DATA")
     parser.add_argument("--src", default="A", help="Nodo origen lógico (clave en names)")
     parser.add_argument("--dst", default="D", help="Nodo destino lógico (clave en names)")
     parser.add_argument("--text", default="Hola desde demo", help="Texto a enviar")
     parser.add_argument("--ttl", type=int, default=10, help="TTL del mensaje DATA")
     parser.add_argument("--warmup", type=float, default=3.0, help="Segundos de espera antes de enviar DATA")
     parser.add_argument("--after", type=float, default=3.0, help="Segundos de espera tras enviar DATA")
+    parser.add_argument("--compare", action="store_true", help="Ejecutar comparación LSR vs DVR")
     args = parser.parse_args()
 
     names = load_names(args.names)
     topo = load_topo(args.topo)
-    nodes = build_nodes(names, topo)
 
-    # Manejo de Ctrl+C
-    signal.signal(signal.SIGINT, handle_sigint(nodes))
+    if args.compare:
+        # Modo comparación: crear nodos con diferentes protocolos
+        print("[demo] ===== COMPARACIÓN LSR vs DVR =====")
+        print("[demo] Nodos A, B: LSR (Dijkstra)")
+        print("[demo] Nodos C, D: DVR (Bellman-Ford)")
+        
+        nodes = {}
+        
+        # Nodos A y B usarán LSR (Dijkstra)
+        for name in ["A", "B"]:
+            cfg = names[name]
+            neighbors = topo.get(name, [])
+            n = Node(
+                name=name, 
+                bind_host=cfg["host"], 
+                bind_port=cfg["port"], 
+                names=names, 
+                neighbors=neighbors,
+                routing_protocol="lsr"
+            )
+            nodes[name] = n
+            n.start()
+        
+        # Nodos C y D usarán DVR (Bellman-Ford)
+        for name in ["C", "D"]:
+            cfg = names[name]
+            neighbors = topo.get(name, [])
+            n = Node(
+                name=name, 
+                bind_host=cfg["host"], 
+                bind_port=cfg["port"], 
+                names=names, 
+                neighbors=neighbors,
+                routing_protocol="dvr"
+            )
+            nodes[name] = n
+            n.start()
 
-    try:
-        start_nodes(nodes)
+        # Manejo de Ctrl+C
+        signal.signal(signal.SIGINT, handle_sigint(nodes))
 
-        # Warmup:
-        # - LSR: deja circular LSP y computar tablas
-        # - Flooding: no es estrictamente necesario, pero ayuda a que HELLO establezca vecinos
-        if args.algo == "lsr":
-            print(f"[demo] Warmup {args.warmup:.1f}s para LSR (emisión/recepción de LSP + Dijkstra)…")
-        else:
-            print(f"[demo] Warmup {args.warmup:.1f}s (HELLO/vecinos)…")
-        time.sleep(max(0.0, args.warmup))
+        try:
+            print("[demo] Esperando 5s a que se propaguen LSPs/DV y se estabilicen rutas...")
+            time.sleep(5)
+            
+            print("\n[demo] ===== TABLAS DE ENRUTAMIENTO =====")
+            for k, n in nodes.items():
+                protocol = "LSR" if n.routing_protocol == "lsr" else "DVR"
+                print(f"{k} ({protocol}) → {n.routing_table}")
+            
+            print("\n[demo] ===== ENVIANDO DATOS =====")
+            
+            # Enviar usando LSR (A→D)
+            print("[demo] Enviando DATA A→D usando LSR...")
+            nodes["A"].send_data("D", "Hola desde A usando LSR", ttl=10)
+            
+            # Enviar usando DVR (C→A)
+            print("[demo] Enviando DATA C→A usando DVR...")
+            nodes["C"].send_data("A", "Hola desde C usando DVR", ttl=10)
+            
+            # Enviar usando flooding (B→C)
+            print("[demo] Enviando DATA B→C usando Flooding...")
+            nodes["B"].send_data_flood("C", "Hola desde B usando Flooding", ttl=10)
 
-        if args.algo == "lsr":
-            print_tables(nodes)
+            print("\n[demo] ===== MONITOREO CONTINUO =====")
+            print("[demo] Presiona Ctrl+C para detener y ver métricas")
+            
+            # Enviar mensajes adicionales para generar métricas
+            time.sleep(2)
+            print("[demo] Enviando mensajes adicionales...")
+            
+            nodes["B"].send_data("A", "Mensaje adicional B→A")
+            nodes["D"].send_data("C", "Mensaje adicional D→C")
+            time.sleep(1)
+            
+            # Mantener corriendo para ver hellos/echos y mensajes de control
+            cycle = 0
+            while True:
+                time.sleep(3)
+                cycle += 1
+                
+                # Mostrar estado de las tablas periódicamente
+                print(f"\n[demo] --- Ciclo {cycle} ---")
+                for k, n in nodes.items():
+                    protocol = "LSR" if n.routing_protocol == "lsr" else "DVR"
+                    routes_count = len([r for r in n.routing_table.values() if r])
+                    print(f"{k} ({protocol}): {routes_count} rutas activas")
+                
+                # Enviar mensaje periódico para mantener actividad
+                if cycle % 3 == 0:
+                    nodes["A"].send_data("D", f"Ping ciclo {cycle}")
+                    print("[demo] Enviado ping periódico A→D")
 
-        demo_send(args.algo, nodes, args.src, args.dst, args.text, args.ttl)
+        except KeyboardInterrupt:
+            print("\n[demo] Interrupción recibida.")
+        finally:
+            stop_nodes(nodes)
 
-        # Espera para que el tráfico llegue y se impriman entregas
-        if args.after > 0:
-            time.sleep(args.after)
+    else:
+        # Modo normal: todos los nodos con el mismo protocolo
+        nodes = build_nodes(names, topo, args.algo)
 
-    finally:
-        stop_nodes(nodes)
+        # Manejo de Ctrl+C
+        signal.signal(signal.SIGINT, handle_sigint(nodes))
+
+        try:
+            start_nodes(nodes)
+
+            # Warmup:
+            # - LSR: deja circular LSP y computar tablas
+            # - DVR: deja circular DV y computar tablas
+            # - Flooding: no es estrictamente necesario, pero ayuda a que HELLO establezca vecinos
+            if args.algo in ["lsr", "dvr"]:
+                print(f"[demo] Warmup {args.warmup:.1f}s para {args.algo.upper()} (emisión/recepción de mensajes de control + computación de rutas)…")
+            else:
+                print(f"[demo] Warmup {args.warmup:.1f}s (HELLO/vecinos)…")
+            time.sleep(max(0.0, args.warmup))
+
+            if args.algo in ["lsr", "dvr"]:
+                print_tables(nodes)
+
+            demo_send(args.algo, nodes, args.src, args.dst, args.text, args.ttl)
+
+            # Espera para que el tráfico llegue y se impriman entregas
+            if args.after > 0:
+                time.sleep(args.after)
+
+        finally:
+            stop_nodes(nodes)
 
 
 if __name__ == "__main__":
