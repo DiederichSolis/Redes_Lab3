@@ -1,4 +1,8 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 from __future__ import annotations
+
+# ---------- Bootstrap de imports (funciona con tu estructura) ----------
 import sys
 from pathlib import Path
 
@@ -6,7 +10,9 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from router.node import Node
+from router.node import Node  # node.py está en router/
+
+# ---------- Imports estándar ----------
 import argparse
 import json
 import signal
@@ -24,16 +30,56 @@ def load_json(path: str) -> dict:
         return json.load(f)
 
 
+def _unwrap_config(obj: dict) -> dict:
+    """
+    Acepta tanto:
+      { "A": {...}, "B": {...} }
+    como:
+      { "type": "names" | "topo", "config": { ... } }
+    """
+    if isinstance(obj, dict) and "config" in obj and isinstance(obj["config"], dict):
+        return obj["config"]
+    return obj
+
+
 def load_names(path: str) -> Dict[str, Dict[str, int]]:
-    data = load_json(path)
+    """
+    Estructuras aceptadas:
+    1) Plano:
+       {
+         "A": {"host": "127.0.0.1", "port": 56001},
+         "B": {"host": "127.0.0.1", "port": 56002}
+       }
+    2) Envuelto:
+       {
+         "type": "names",
+         "config": {
+           "A": {"host": "127.0.0.1", "port": 56001},
+           "B": {"host": "127.0.0.1", "port": 56002}
+         }
+       }
+    """
+    raw = load_json(path)
+    data = _unwrap_config(raw)
     names: Dict[str, Dict[str, int]] = {}
     for k, v in data.items():
-        names[k] = {"host": v["host"], "port": int(v["port"])}
+        # v debe ser un dict con host/port
+        host = v["host"]
+        port = int(v["port"])
+        names[k] = {"host": host, "port": port}
     return names
 
 
 def load_topo(path: str) -> Dict[str, List[str]]:
-    data = load_json(path)
+    """
+    Estructuras aceptadas:
+    1) Plano:
+       { "A": ["B","C"], "B": ["A","D"] }
+    2) Envuelto:
+       { "type": "topo", "config": { "A": ["B","C"], ... } }
+    """
+    raw = load_json(path)
+    data = _unwrap_config(raw)
     topo: Dict[str, List[str]] = {}
     for k, v in data.items():
         topo[k] = list(v)
@@ -137,6 +183,9 @@ def main():
     try:
         start_nodes(nodes)
 
+        # Warmup:
+        # - LSR: deja circular LSP y computar tablas
+        # - Flooding: no es estrictamente necesario, pero ayuda a que HELLO establezca vecinos
         if args.algo == "lsr":
             print(f"[demo] Warmup {args.warmup:.1f}s para LSR (emisión/recepción de LSP + Dijkstra)…")
         else:
