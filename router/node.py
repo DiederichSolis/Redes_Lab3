@@ -6,7 +6,7 @@ import random
 import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 try:
     from .message import Message
@@ -39,9 +39,7 @@ class Node:
         # Vecinos lógicos
         self.neighbors: Set[str] = set(neighbors)
 
-        # Mapa de nombres:
-        #  - UDP: logical -> {"host","port"}
-        #  - Redis: logical -> "usuario"
+        # Mapa de nombres
         self.names: Dict[str, Any] = names
 
         # Transporte
@@ -49,13 +47,13 @@ class Node:
         if self.transport not in ("udp", "redis"):
             raise ValueError("transport debe ser 'udp' o 'redis'")
 
-        # Grafo dirigido con pesos: {u: {v: w, ...}, ...}
+        # Grafo dirigido con pesos: {u: {v: w, ...}}
         self.graph: Dict[str, Dict[str, float]] = {}
         self.graph[self.name] = {}
         for v in self.neighbors:
-            self.graph[self.name][v] = 1.0  # costo base (puedes cambiar a RTT)
+            self.graph[self.name][v] = 1.0  # costo base
 
-        # Tabla de ruteo (next hop por destino) calculada desde self.graph
+        # Tabla de ruteo (next hop por destino)
         self.routing_table: Dict[str, str] = {}
 
         # Control de duplicados
@@ -76,101 +74,64 @@ class Node:
         self.t_routing = None
         self.t_hello = None
 
-        # UDP socket (solo si transport=udp)
+        # UDP socket (sólo si transport=udp)
         self.sock: Optional[socket.socket] = None
         if self.transport == "udp":
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.bind(self.addr)
             self.sock.settimeout(0.5)
 
-        # Redis (solo si transport=redis)
-        self.r = None           # redis.Redis
-        self.pubsub = None      # redis.client.PubSub
+        # Redis (sólo si transport=redis)
+        self.r = None            # redis.Redis
+        self.pubsub = None       # redis.client.PubSub
         self.redis_cfg = redis_cfg or {}
         self.redis_channel_self: Optional[str] = None
         self.redis_channel_map: Dict[str, str] = {}
-        self.redis_channel_prefix: Optional[str] = None
-        self.redis_sec: Optional[int] = None
-        self.redis_grupo: Optional[int] = None
 
         if self.transport == "redis":
             self._init_redis_config()
 
     # ---------------- Redis helpers ----------------
     def _init_redis_config(self) -> None:
-        """
-        Prepara construcción de canales y conexión Redis (lazily).
-        """
         cfg = self.redis_cfg
-
-        # Canales:
-        # 1) channel_map explícito
+        self.redis_channel_self = cfg.get("channel_self")
         self.redis_channel_map = dict(cfg.get("channel_map", {}))
 
-        # 2) prefix o (sec,grupo) para componer:  f"{prefix}.{usuario}"  o  f"sec{sec}.grupo{grupo}.{usuario}"
-        self.redis_channel_prefix = cfg.get("channel_prefix")
-        self.redis_sec = cfg.get("sec", None)
-        self.redis_grupo = cfg.get("grupo", None)
-
-        # Canal propio
-        self.redis_channel_self = cfg.get("channel_self") or self._build_channel_for(self.name)
+        if not self.redis_channel_self:
+            raise ValueError("[Redis] Falta 'channel_self' en redis_cfg")
 
     def _ensure_redis_client(self) -> None:
         """
-        Crea cliente Redis y pubsub si no existen. Importa 'redis'
+        Crea cliente Redis y pubsub si no existen. Importa 'redis' perezosamente.
         """
         if self.r is not None and self.pubsub is not None:
             return
         try:
             import redis  # type: ignore
         except Exception as e:
-            raise ImportError("Falta la dependencia 'redis'. Instala con: pip install redis") from e
+            raise ImportError("Falta la dependencia 'redis'. Instálala con: pip install redis") from e
 
         host = self.redis_cfg.get("host", "localhost")
         port = int(self.redis_cfg.get("port", 6379))
         pwd = self.redis_cfg.get("pwd")
 
-        # Conexión
+        # Conexión y ping
         self.r = redis.Redis(host=host, port=port, password=pwd, decode_responses=True)
-        # Probar conexión
-        try:
-            self.r.ping()
-        except Exception as e:
-            raise ConnectionError(f"No se pudo conectar a Redis {host}:{port}: {e}")
+        self.r.ping()
 
-        # PubSub
+        # PubSub suscrito a canal propio
         self.pubsub = self.r.pubsub(ignore_subscribe_messages=True)
-        chan = self.redis_channel_self
-        if not chan:
-            raise ValueError("redis_channel_self no definido")
-        self.pubsub.subscribe(chan)
+        self.pubsub.subscribe(self.redis_channel_self)
 
-    def _build_channel_for(self, logical_name: str) -> Optional[str]:
-
-        # 1) channel_map explícito
-        if logical_name in self.redis_channel_map:
-            return self.redis_channel_map[logical_name]
-
-        # 2) desde names -> usuario o canal
-        user_or_channel = self.names.get(logical_name)
-        if user_or_channel is None:
-            return None
-
-        # si ya parece canal completo, úsalo
-        if isinstance(user_or_channel, str) and ("." in user_or_channel):
-            return user_or_channel
-
-        # construir desde usuario
-        if isinstance(user_or_channel, str):
-            user = user_or_channel
-            if self.redis_channel_prefix:
-                return f"{self.redis_channel_prefix}.{user}"
-            if self.redis_sec is not None and self.redis_grupo is not None:
-                return f"sec{self.redis_sec}.grupo{self.redis_grupo}.{user}"
-            # sin info suficiente
-            return user  # último recurso (lo tratará como canal = usuario)
-
-        return None
+    def _resolve_channel(self, logical_name: str) -> Optional[str]:
+        """
+        Devuelve el canal Redis de un vecino lógico usando ÚNICAMENTE channel_map.
+        """
+        ch = self.redis_channel_map.get(logical_name)
+        if not ch:
+            print(f"[{self.name}] WARN Redis: no hay canal para '{logical_name}'. "
+                  f"Añádelo en redis_cfg['channel_map']. Envío omitido.")
+        return ch
 
     # ---------------- ciclo de vida ----------------
     def start(self) -> None:
@@ -204,9 +165,14 @@ class Node:
             except Exception:
                 pass
 
-        # Cierre Redis
+        # Cierre Redis: unsubscribe + close
         if self.pubsub is not None:
             try:
+                if self.redis_channel_self:
+                    try:
+                        self.pubsub.unsubscribe(self.redis_channel_self)  # type: ignore
+                    except Exception:
+                        pass
                 self.pubsub.close()  # type: ignore
             except Exception:
                 pass
@@ -227,7 +193,7 @@ class Node:
     # ---------------- envío ----------------
     def send_raw(self, logical_name: str, json_str: str) -> None:
         """
-        Envía el json_str al vecino 'logical_name' usando el transporte configurado.
+        Envía json_str al vecino 'logical_name' usando el transporte configurado.
         """
         if self.stop_event.is_set():
             return
@@ -252,27 +218,36 @@ class Node:
                 print(f"[{self.name}] ERROR sendto({logical_name} {addr}): {e}")
 
     def _send_raw_redis(self, logical_name: str, json_str: str) -> None:
+        if self.stop_event.is_set():
+            return
+        channel = self._resolve_channel(logical_name)
+        if not channel:
+            return
+
+        # Intento 1
         try:
             self._ensure_redis_client()
+            self.r.publish(channel, json_str)  # type: ignore
+            return
         except Exception as e:
-            if not self.stop_event.is_set():
-                print(f"[{self.name}] Redis no disponible: {e}")
-            return
-        channel = self._build_channel_for(logical_name)
-        if not channel:
-            print(f"[{self.name}] Redis send_raw: no pude resolver canal para '{logical_name}'")
-            return
+            if self.stop_event.is_set():
+                return
+            print(f"[{self.name}] Redis publish falló (1er intento): {e}. Reintentando…")
+
+        # Reintento con reconexión
         try:
-            # Publica al canal del next-hop
+            self.r = None
+            self.pubsub = None
+            self._ensure_redis_client()
             self.r.publish(channel, json_str)  # type: ignore
         except Exception as e:
             if not self.stop_event.is_set():
-                print(f"[{self.name}] ERROR publish({channel}): {e}")
+                print(f"[{self.name}] ERROR publish({channel}) tras reintento: {e}")
 
     def send(self, m: Message) -> None:
         """
         Enrutador de alto nivel.
-        - Para LSR/DATA: decide next hop por routing_table; si no hay, broadcast a vecinos.
+        - Para LSR/DATA: decide next hop por routing_table; si no hay, broadcast.
         - Para otros, si 'dst' es vecino lógico, envía directo; si no, broadcast.
         """
         if m.proto == "lsr" and m.type == "data":
@@ -311,7 +286,6 @@ class Node:
             self.incoming.put(raw)
 
     def _listener_redis(self) -> None:
-        # Ya debe estar suscrito a channel_self
         try:
             self._ensure_redis_client()
         except Exception as e:
@@ -319,16 +293,17 @@ class Node:
                 print(f"[{self.name}] listener Redis no pudo conectar: {e}")
             return
 
-        # Loop de escucha
         while not self.stop_event.is_set():
             try:
                 msg = self.pubsub.get_message(timeout=0.5)  # type: ignore
             except Exception as e:
-                if not self.stop_event.is_set():
-                    print(f"[{self.name}] pubsub error: {e}")
-                # intenta reconectar
+                if self.stop_event.is_set():
+                    break
+                print(f"[{self.name}] pubsub error: {e}. Reintentando suscripción…")
                 time.sleep(0.5)
                 try:
+                    self.r = None
+                    self.pubsub = None
                     self._ensure_redis_client()
                 except Exception:
                     pass
@@ -336,22 +311,20 @@ class Node:
 
             if not msg:
                 continue
-            # Solo mensajes "message"
             if msg.get("type") != "message":
                 continue
 
             data = msg.get("data")
             if not data:
                 continue
-            if isinstance(data, (bytes, bytearray)):
+            if isinstance(data, str):
+                raw = data
+            else:
                 try:
-                    raw = data.decode("utf-8")
+                    raw = data.decode("utf-8")  # bytes
                 except Exception:
                     continue
-            else:
-                raw = str(data)
 
-            # Empuja a la cola para que el forwarding loop procese
             self.incoming.put(raw)
 
     # ---------------- forwarding ----------------
@@ -474,7 +447,7 @@ class Node:
     def _routing_loop(self) -> None:
         """
         1) Recalcula tabla de ruteo periódicamente.
-        2) Emite un LSP con sus enlaces actuales cada ~3s.
+        2) Emite LSP con enlaces actuales cada ~3s.
         """
         next_lsp_at = 0.0
         while not self.stop_event.is_set():
@@ -494,7 +467,7 @@ class Node:
             time.sleep(1.0)
 
     def _recompute_routes(self) -> None:
-        # Asegura que existan nodos/entradas
+        # Asegurar nodos/entradas
         for u, nbrs in list(self.graph.items()):
             self.graph.setdefault(u, {})
             for v in list(nbrs.keys()):
