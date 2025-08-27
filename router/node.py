@@ -30,6 +30,7 @@ class Node:
         neighbors: List[str],
         transport: str = "udp",
         redis_cfg: Optional[Dict[str, Any]] = None,
+        routing_protocol: Optional[str] = None,   # <-- nuevo
     ) -> None:
         self.name = name
         self.host = bind_host
@@ -46,6 +47,16 @@ class Node:
         self.transport: str = transport.lower().strip()
         if self.transport not in ("udp", "redis"):
             raise ValueError("transport debe ser 'udp' o 'redis'")
+
+        # ---------------- routing ----------------
+        # normaliza y valida el protocolo: lsr | dvr | flooding
+        rp = (routing_protocol or "lsr").lower().strip()
+        allowed = {"lsr", "dvr", "flooding"}
+        if rp not in allowed:
+            raise ValueError(
+                f"routing_protocol inválido '{rp}'. Usa uno de {sorted(allowed)}"
+            )
+        self.routing_protocol: str = rp
 
         # Grafo dirigido con pesos: {u: {v: w, ...}}
         self.graph: Dict[str, Dict[str, float]] = {}
@@ -90,6 +101,7 @@ class Node:
 
         if self.transport == "redis":
             self._init_redis_config()
+
 
     # ---------------- Redis helpers ----------------
     def _init_redis_config(self) -> None:

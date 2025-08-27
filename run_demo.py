@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+from typing import Dict, Any
 
 # ---------- Bootstrap de imports (funciona con tu estructura) ----------
 import sys
@@ -89,45 +90,55 @@ def load_topo(path: str) -> Dict[str, List[str]]:
 
 
 # ---------- Construcción / control de nodos ----------
-def build_nodes(names: Dict[str, Dict[str, int]], topo: Dict[str, List[str]], protocol: str = "lsr") -> Dict[str, Node]:
+def build_nodes(names, topo, algo, transport="udp", redis_cfg=None):
     nodes: Dict[str, Node] = {}
-    # Asegura que todos los que están en names existan en topo (aunque sea con lista vacía)
+
+    allowed = {"lsr", "dvr", "flooding"}
+    default_protocol = str(algo).lower()
+    if default_protocol not in allowed:
+        default_protocol = "lsr"
+
+    # Asegura que todos los que están en names existan en topo
     for n in names.keys():
         topo.setdefault(n, [])
+
+    # Mapa lógico -> canal Redis (si no hay 'channel' en names, usa el nombre)
+    channel_map = {k: str(v.get("channel", k)) for k, v in names.items()}
 
     for name, cfg in names.items():
         host = cfg["host"]
         port = int(cfg["port"])
         neighbors = topo.get(name, [])
+
+        # Override opcional de protocolo en names.json
+        node_protocol = str(cfg.get("protocol", default_protocol)).lower()
+        if node_protocol not in allowed:
+            node_protocol = default_protocol
+
+        # redis_cfg por nodo (solo si transport=redis)
+        node_redis_cfg = None
+        if transport == "redis":
+            base = dict(redis_cfg or {})
+            base.update({
+                "channel_self": channel_map[name],
+                "channel_map": channel_map,
+                "decode_responses": True,
+            })
+            node_redis_cfg = base
+
         nodes[name] = Node(
             name=name,
             bind_host=host,
             bind_port=port,
             names=names,
             neighbors=neighbors,
-            routing_protocol=protocol
+            transport=transport,
+            redis_cfg=node_redis_cfg,
+            routing_protocol=node_protocol,
         )
+
     return nodes
 
-
-def start_nodes(nodes: Dict[str, Node]) -> None:
-    for n in nodes.values():
-        n.start()
-    print(f"[demo] {len(nodes)} nodos iniciados.")
-
-
-def stop_nodes(nodes: Dict[str, Node]) -> None:
-    for n in nodes.values():
-        n.stop()
-    print("[demo] Nodos detenidos.")
-
-
-def print_tables(nodes: Dict[str, Node]) -> None:
-    print("\n[demo] Tablas de ruteo actuales:")
-    for name in sorted(nodes.keys()):
-        rt = getattr(nodes[name], "routing_table", {})
-        protocol = getattr(nodes[name], "routing_protocol", "unknown").upper()
-        print(f"  - {name} ({protocol}): {rt}")
 
 
 # ---------- Envío de mensaje de prueba ----------
@@ -181,6 +192,24 @@ def handle_sigint(nodes: Dict[str, Node]):
 
     return _handler
 
+def start_nodes(nodes: Dict[str, Node]) -> None:
+    for n in nodes.values():
+        n.start()
+    print(f"[demo] {len(nodes)} nodos iniciados.")
+
+def stop_nodes(nodes: Dict[str, Node]) -> None:
+    for n in nodes.values():
+        n.stop()
+    print("[demo] Nodos detenidos.")
+
+def print_tables(nodes: Dict[str, Any]) -> None:
+    print("\n[demo] Tablas de ruteo actuales:")
+    for name in sorted(nodes.keys()):
+        n = nodes[name]
+        protocol = getattr(n, "routing_protocol", "unknown").upper()
+        rt = getattr(n, "routing_table", {})
+        print(f"  - {name} ({protocol}): {rt}")
+
 
 # ---------- Main ----------
 def main():
@@ -195,45 +224,68 @@ def main():
     parser.add_argument("--warmup", type=float, default=3.0, help="Segundos de espera antes de enviar DATA")
     parser.add_argument("--after", type=float, default=3.0, help="Segundos de espera tras enviar DATA")
     parser.add_argument("--compare", action="store_true", help="Ejecutar comparación LSR vs DVR")
+
+    # --- flags de transporte (Parte 2) ---
+    parser.add_argument("--transport", choices=["udp", "redis"], default="udp",
+                        help="Medio de transporte: udp o redis (Parte 2)")
+    parser.add_argument("--redis-host", default="lab3.redesuvg.cloud")
+    parser.add_argument("--redis-port", type=int, default=6379)
+    parser.add_argument("--redis-password", default="UVGRedis2025")
+
     args = parser.parse_args()
 
     names = load_names(args.names)
     topo = load_topo(args.topo)
 
+    # --- bloque Redis cfg (solo si transport=redis) ---
+    redis_cfg = None
+    if args.transport == "redis":
+        redis_cfg = {
+            "host": args.redis_host,
+            "port": args.redis_port,
+            "password": args.redis_password,
+            "decode_responses": True,
+        }
+
     if args.compare:
         # Modo comparación: crear nodos con diferentes protocolos
         print("[demo] ===== COMPARACIÓN LSR vs DVR =====")
+        print("[demo] Transporte:", args.transport.upper())
         print("[demo] Nodos A, B: LSR (Dijkstra)")
         print("[demo] Nodos C, D: DVR (Bellman-Ford)")
-        
+
         nodes = {}
-        
-        # Nodos A y B usarán LSR (Dijkstra)
+
+        # A y B con LSR
         for name in ["A", "B"]:
             cfg = names[name]
             neighbors = topo.get(name, [])
             n = Node(
-                name=name, 
-                bind_host=cfg["host"], 
-                bind_port=cfg["port"], 
-                names=names, 
+                name=name,
+                bind_host=cfg["host"],
+                bind_port=cfg["port"],
+                names=names,
                 neighbors=neighbors,
-                routing_protocol="lsr"
+                transport=args.transport,
+                redis_cfg=redis_cfg,
+                routing_protocol="lsr",
             )
             nodes[name] = n
             n.start()
-        
-        # Nodos C y D usarán DVR (Bellman-Ford)
+
+        # C y D con DVR
         for name in ["C", "D"]:
             cfg = names[name]
             neighbors = topo.get(name, [])
             n = Node(
-                name=name, 
-                bind_host=cfg["host"], 
-                bind_port=cfg["port"], 
-                names=names, 
+                name=name,
+                bind_host=cfg["host"],
+                bind_port=cfg["port"],
+                names=names,
                 neighbors=neighbors,
-                routing_protocol="dvr"
+                transport=args.transport,
+                redis_cfg=redis_cfg,
+                routing_protocol="dvr",
             )
             nodes[name] = n
             n.start()
@@ -244,51 +296,39 @@ def main():
         try:
             print("[demo] Esperando 5s a que se propaguen LSPs/DV y se estabilicen rutas...")
             time.sleep(5)
-            
+
             print("\n[demo] ===== TABLAS DE ENRUTAMIENTO =====")
             for k, n in nodes.items():
                 protocol = "LSR" if n.routing_protocol == "lsr" else "DVR"
                 print(f"{k} ({protocol}) → {n.routing_table}")
-            
+
             print("\n[demo] ===== ENVIANDO DATOS =====")
-            
-            # Enviar usando LSR (A→D)
             print("[demo] Enviando DATA A→D usando LSR...")
             nodes["A"].send_data("D", "Hola desde A usando LSR", ttl=10)
-            
-            # Enviar usando DVR (C→A)
+
             print("[demo] Enviando DATA C→A usando DVR...")
             nodes["C"].send_data("A", "Hola desde C usando DVR", ttl=10)
-            
-            # Enviar usando flooding (B→C)
+
             print("[demo] Enviando DATA B→C usando Flooding...")
             nodes["B"].send_data_flood("C", "Hola desde B usando Flooding", ttl=10)
 
             print("\n[demo] ===== MONITOREO CONTINUO =====")
             print("[demo] Presiona Ctrl+C para detener y ver métricas")
-            
-            # Enviar mensajes adicionales para generar métricas
             time.sleep(2)
             print("[demo] Enviando mensajes adicionales...")
-            
             nodes["B"].send_data("A", "Mensaje adicional B→A")
             nodes["D"].send_data("C", "Mensaje adicional D→C")
             time.sleep(1)
-            
-            # Mantener corriendo para ver hellos/echos y mensajes de control
+
             cycle = 0
             while True:
                 time.sleep(3)
                 cycle += 1
-                
-                # Mostrar estado de las tablas periódicamente
                 print(f"\n[demo] --- Ciclo {cycle} ---")
                 for k, n in nodes.items():
                     protocol = "LSR" if n.routing_protocol == "lsr" else "DVR"
                     routes_count = len([r for r in n.routing_table.values() if r])
                     print(f"{k} ({protocol}): {routes_count} rutas activas")
-                
-                # Enviar mensaje periódico para mantener actividad
                 if cycle % 3 == 0:
                     nodes["A"].send_data("D", f"Ping ciclo {cycle}")
                     print("[demo] Enviado ping periódico A→D")
@@ -300,18 +340,19 @@ def main():
 
     else:
         # Modo normal: todos los nodos con el mismo protocolo
-        nodes = build_nodes(names, topo, args.algo)
+        nodes = build_nodes(
+            names,
+            topo,
+            args.algo,
+            transport=args.transport,   # <-- pasa transporte
+            redis_cfg=redis_cfg,        # <-- pasa redis_cfg (o None)
+        )
 
-        # Manejo de Ctrl+C
         signal.signal(signal.SIGINT, handle_sigint(nodes))
 
         try:
             start_nodes(nodes)
 
-            # Warmup:
-            # - LSR: deja circular LSP y computar tablas
-            # - DVR: deja circular DV y computar tablas
-            # - Flooding: no es estrictamente necesario, pero ayuda a que HELLO establezca vecinos
             if args.algo in ["lsr", "dvr"]:
                 print(f"[demo] Warmup {args.warmup:.1f}s para {args.algo.upper()} (emisión/recepción de mensajes de control + computación de rutas)…")
             else:
@@ -323,7 +364,6 @@ def main():
 
             demo_send(args.algo, nodes, args.src, args.dst, args.text, args.ttl)
 
-            # Espera para que el tráfico llegue y se impriman entregas
             if args.after > 0:
                 time.sleep(args.after)
 
