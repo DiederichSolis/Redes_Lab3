@@ -105,12 +105,140 @@ class Node:
 
     # ---------------- Redis helpers ----------------
     def _init_redis_config(self) -> None:
-        cfg = self.redis_cfg
-        self.redis_channel_self = cfg.get("channel_self")
-        self.redis_channel_map = dict(cfg.get("channel_map", {}))
-
-        if not self.redis_channel_self:
+    
+        if not isinstance(self.redis_cfg, dict):
+            raise ValueError("[Redis] redis_cfg inválido")
+        if "channel_self" not in self.redis_cfg:
             raise ValueError("[Redis] Falta 'channel_self' en redis_cfg")
+        if "channel_map" not in self.redis_cfg:
+            raise ValueError("[Redis] Falta 'channel_map' en redis_cfg")
+
+        import redis
+
+        # Cliente autenticado por contraseña (todas las conexiones del pool quedan auth)
+        self.r = redis.Redis(
+            host=self.redis_cfg.get("host", "lab3.redesuvg.cloud"),
+            port=int(self.redis_cfg.get("port", 6379)),
+            username=self.redis_cfg.get("username") or None,
+            password=self.redis_cfg.get("password", None),
+            decode_responses=bool(self.redis_cfg.get("decode_responses", True)),
+        )
+
+        # Verificar conexión / autenticación
+        try:
+            self.r.ping()
+        except redis.exceptions.AuthenticationError as e:
+            raise ValueError(f"[Redis] Error de autenticación: {e}")
+        except Exception as e:
+            raise ValueError(f"[Redis] No se pudo conectar a Redis: {e}")
+
+        # Canales
+        self.redis_channel_self = str(self.redis_cfg["channel_self"])
+        self.redis_channel_map = {k: str(v) for k, v in self.redis_cfg["channel_map"].items()}
+
+        # Pub/Sub y suscripción a canal propio
+        self.pubsub = self.r.pubsub(ignore_subscribe_messages=True)
+        self.pubsub.subscribe(self.redis_channel_self)
+
+        # Lanzar hilo listener (si no está corriendo)
+        if not getattr(self, "t_pubsub", None) or not self.t_pubsub or not self.t_pubsub.is_alive():
+            self.t_pubsub = threading.Thread(target=self._pubsub_loop, daemon=True)
+            self.t_pubsub.start()
+
+        print(f"[{self.name}] Redis listo. Canal propio='{self.redis_channel_self}'")
+
+
+
+
+    def _pubsub_loop(self) -> None:
+        """
+        Listener de Pub/Sub robusto:
+        - usa get_message(timeout) para no bloquear
+        - reintenta suscripción si cae la conexión
+        - no loguea ni reintenta si estamos en shutdown
+        """
+        import time
+        try:
+            import redis  # type: ignore
+        except Exception:
+            redis = None  # por si ya está importado arriba
+
+        while not self.stop_event.is_set():
+            try:
+                # (re)crear y suscribir si no existe
+                if self.pubsub is None:
+                    if self.stop_event.is_set():
+                        break
+                    self.pubsub = self.r.pubsub(ignore_subscribe_messages=True)
+                    self.pubsub.subscribe(self.redis_channel_self)
+                    time.sleep(0.1)
+
+                # lectura no bloqueante
+                msg = self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if not msg:
+                    time.sleep(0.05)
+                    continue
+                if msg.get("type") != "message":
+                    continue
+
+                raw = msg.get("data")
+                if isinstance(raw, bytes):
+                    try:
+                        raw = raw.decode("utf-8", "ignore")
+                    except Exception:
+                        continue
+
+                # encolar para el forwarding
+                self.incoming.put(raw)
+
+            except (AttributeError, OSError) as e:
+                # p.ej. "'NoneType' has no attribute 'get_message'" o "I/O operation on closed file"
+                if self.stop_event.is_set():
+                    break
+                print(f"[{self.name}] PubSub error: {e}. Reintentando…")
+                try:
+                    if self.pubsub:
+                        self.pubsub.close()
+                except Exception:
+                    pass
+                self.pubsub = None  # se recrea en el próximo ciclo
+                time.sleep(0.3)
+
+            except Exception as e:
+                if self.stop_event.is_set():
+                    break
+                print(f"[{self.name}] PubSub error: {e}. Reintentando…")
+                try:
+                    if self.pubsub:
+                        self.pubsub.close()
+                except Exception:
+                    pass
+                self.pubsub = None
+                time.sleep(0.3)
+
+        # salida limpia
+        try:
+            if self.pubsub:
+                self.pubsub.close()
+        except Exception:
+            pass
+        finally:
+            self.pubsub = None
+
+    def send_hello(self, dst: str, ttl: int = 8) -> None:
+        import time
+        m = Message(
+            proto="sys",
+            type="hello",
+            src=self.name,
+            dst=dst,
+            ttl=ttl,
+            headers={"t0": time.time()},
+            payload={},
+            hops=0,
+        )
+        self.send(m)
+
 
     def _ensure_redis_client(self) -> None:
         """
@@ -167,53 +295,112 @@ class Node:
         self.t_hello.start()
 
     def stop(self) -> None:
-        self.stop_event.set()
-        time.sleep(0.1)
-
-        # Cierre UDP
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-
-        # Cierre Redis: unsubscribe + close
-        if self.pubsub is not None:
-            try:
-                if self.redis_channel_self:
-                    try:
-                        self.pubsub.unsubscribe(self.redis_channel_self)  # type: ignore
-                    except Exception:
-                        pass
-                self.pubsub.close()  # type: ignore
-            except Exception:
-                pass
-        if self.r is not None:
-            try:
-                self.r.close()  # type: ignore
-            except Exception:
-                pass
-
-        # Join threads
-        for t in (self.t_listener, self.t_pubsub, self.t_forward, self.t_routing, self.t_hello):
-            try:
-                if t and t.is_alive():
-                    t.join(timeout=0.5)
-            except Exception:
-                pass
-
-    # ---------------- envío ----------------
-    def send_raw(self, logical_name: str, json_str: str) -> None:
-        """
-        Envía json_str al vecino 'logical_name' usando el transporte configurado.
-        """
+        """Apagado limpio: señal, join de hilos y cierre de transports."""
+        # Evita doble stop
         if self.stop_event.is_set():
             return
 
+        # 1) Señal de parada para que loops salgan solos
+        self.stop_event.set()
+
+        # 2) Dar un respiro corto para que detecten la señal
+        try:
+            import time
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+        # 3) Unir hilos primero (así no usan recursos ya cerrados)
+        for t in [self.t_forward, self.t_routing, self.t_hello, self.t_listener, self.t_pubsub]:
+            if t and t.is_alive():
+                try:
+                    t.join(timeout=0.8)
+                except Exception:
+                    pass
+
+        # 4) Cerrar transports/sockets después de unir hilos
         if self.transport == "udp":
-            self._send_raw_udp(logical_name, json_str)
-        else:
-            self._send_raw_redis(logical_name, json_str)
+            try:
+                if self.sock:
+                    self.sock.close()
+            except Exception:
+                pass
+            finally:
+                self.sock = None
+        elif self.transport == "redis":
+            # Cierra pubsub y conexiones del pool
+            try:
+                if self.pubsub:
+                    self.pubsub.close()
+            except Exception:
+                pass
+            finally:
+                self.pubsub = None
+            try:
+                if self.r:
+                    self.r.connection_pool.disconnect()
+            except Exception:
+                pass
+            finally:
+                self.r = None
+
+        # 5) Limpieza de refs a hilos
+        self.t_forward = None
+        self.t_routing = None
+        self.t_hello = None
+        self.t_listener = None
+        self.t_pubsub = None
+
+
+
+    # ---------------- envío ----------------
+    def send_raw(self, next_hop: str, raw_json: str) -> None:
+    
+        #next_hop es el nombre lógico del vecino.
+        #- Redis: publish al canal del vecino
+        #- UDP: sendto al (host, port) correspondiente
+        #Silencia errores cuando estamos en shutdown.
+        # No envíes nada si ya estamos parando
+        if self.stop_event.is_set():
+            return
+
+        # Asegura string
+        if not isinstance(raw_json, str):
+            try:
+                import json as _json
+                raw_json = _json.dumps(raw_json)
+            except Exception:
+                raw_json = str(raw_json)
+
+        if self.transport == "redis":
+            ch = (self.redis_channel_map or {}).get(next_hop)
+            if not ch:
+                if not self.stop_event.is_set():
+                    print(f"[{self.name}] Canal Redis desconocido para '{next_hop}'")
+                return
+            try:
+                self.r.publish(ch, raw_json)
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    print(f"[{self.name}] Error publish Redis -> {ch}: {e}")
+            return
+
+        # --- UDP ---
+        try:
+            addr = self._sock_addr(next_hop)
+        except Exception as e:
+            if not self.stop_event.is_set():
+                print(f"[{self.name}] No pude resolver addr de '{next_hop}': {e}")
+            return
+
+        try:
+            if self.sock is not None:
+                self.sock.sendto(raw_json.encode("utf-8"), addr)
+        except Exception as e:
+            if not self.stop_event.is_set():
+                print(f"[{self.name}] Error UDP sendto -> {next_hop}: {e}")
+
+
 
     def _send_raw_udp(self, logical_name: str, json_str: str) -> None:
         if self.sock is None:
@@ -347,16 +534,29 @@ class Node:
             except queue.Empty:
                 continue
 
+            # Parseo robusto
             try:
                 m = Message.from_json(raw)
             except Exception as e:
                 print(f"[{self.name}] paquete inválido: {raw[:80]}... err={e}")
                 continue
 
-            # TTL
+            # ---------- Normalización y actualización de TTL/HOPS ----------
+            # HOPS: +1 por cada salto (forwarding)
+            try:
+                m.hops = int(getattr(m, "hops", 0)) + 1
+            except Exception:
+                m.hops = 1
+
+            # TTL: si llega agotado, descarta; si no, decrementa
+            try:
+                m.ttl = int(getattr(m, "ttl", 8))
+            except Exception:
+                m.ttl = 8
             if m.ttl <= 0:
                 continue
             m.ttl -= 1
+            # ---------------------------------------------------------------
 
             # --- HELLO/ECHO ---
             if m.type == "hello":
@@ -369,6 +569,7 @@ class Node:
                         ttl=8,
                         headers={"t0": m.headers.get("t0", 0.0)},
                         payload={},
+                        hops=0,  # nuevo mensaje de respuesta
                     )
                     self.send(echo)
                 continue
@@ -409,6 +610,7 @@ class Node:
                         ttl=m.ttl,
                         headers={"came_from": self.name},
                         payload=lsp,
+                        hops=m.hops,  # propaga hops actualizados
                     )
                     self.send_raw(v, fwd.to_json())
                 continue
@@ -438,15 +640,17 @@ class Node:
                         ttl=m.ttl,
                         headers={"id": msg_id, "came_from": self.name},
                         payload=m.payload,
+                        hops=m.hops,  # propaga hops
                     )
                     self.send_raw(v, fwd.to_json())
                 continue
 
-            # --- DATA genérico (LSR u otros) ---
+            # --- DATA genérico (LSR/DVR) ---
             if m.type == "data":
                 if m.dst == self.name:
-                    self._deliver(m)
+                    self._deliver(m)  # entrega final (usa m.hops actualizado)
                 else:
+                    # Reenvío: 'send' decide next-hop y usa m.to_json() internamente
                     self.send(m)
                 continue
 
@@ -454,6 +658,7 @@ class Node:
             if m.type == "info" and m.dst == self.name:
                 print(f"[{self.name}] INFO: {m.payload}")
                 continue
+
 
     # ---------------- routing (Dijkstra + LSP emit) ----------------
     def _routing_loop(self) -> None:
@@ -554,11 +759,31 @@ class Node:
 
     # ---------------- utils de entrega/usuario ----------------
     def _deliver(self, m: Message) -> None:
-        print(f"[{self.name}] DATA entregado de {m.src} → {m.dst} | payload={json.dumps(m.payload, ensure_ascii=False)}")
+        # imprime hops y payload bonito
+        try:
+            import json
+            payload_str = json.dumps(m.payload)
+        except Exception:
+            payload_str = str(m.payload)
+        print(f"[{self.name}] DATA entregado de {m.src} → {m.dst} (hops={getattr(m, 'hops', '?')}) | payload={payload_str}")
+
 
     def send_data(self, dst: str, text: str, ttl: int = 12) -> None:
-        m = Message(proto="lsr", type="data", src=self.name, dst=dst, ttl=ttl, payload={"text": text})
+        if self.routing_protocol == "flooding":
+            self.send_data_flood(dst, text, ttl=ttl)
+            return
+        m = Message(
+            proto=self.routing_protocol,  # "lsr" o "dvr"
+            type="data",
+            src=self.name,
+            dst=dst,
+            ttl=ttl,
+            headers={},
+            payload={"text": text},
+            hops=0,                       # ← arranca en 0
+        )
         self.send(m)
+
 
     def send_data_flood(self, dst: str, text: str, ttl: int = 12) -> None:
         msg_id = f"{self.name}-{int(time.time() * 1000)}-{random.randint(0, 9999)}"

@@ -45,77 +45,68 @@ def _unwrap_config(obj: dict) -> dict:
     return obj
 
 
-def load_names(path: str) -> Dict[str, Dict[str, int]]:
-    """
-    Estructuras aceptadas:
-    1) Plano:
-       {
-         "A": {"host": "127.0.0.1", "port": 56001},
-         "B": {"host": "127.0.0.1", "port": 56002}
-       }
-    2) Envuelto:
-       {
-         "type": "names",
-         "config": {
-           "A": {"host": "127.0.0.1", "port": 56001},
-           "B": {"host": "127.0.0.1", "port": 56002}
-         }
-       }
-    """
-    raw = load_json(path)
-    data = _unwrap_config(raw)
-    names: Dict[str, Dict[str, int]] = {}
-    for k, v in data.items():
-        # v debe ser un dict con host/port
-        host = v["host"]
-        port = int(v["port"])
-        names[k] = {"host": host, "port": port}
-    return names
+import json
 
+def load_names(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # Acepta los dos formatos:
+    # 1) plano: {"A": {...}, "B": {...}}
+    # 2) envuelto: {"type": "names", "config": {...}}
+    if isinstance(data, dict) and "config" in data and isinstance(data["config"], dict):
+        return data["config"]
+    return data
 
-def load_topo(path: str) -> Dict[str, List[str]]:
-    """
-    Estructuras aceptadas:
-    1) Plano:
-       { "A": ["B","C"], "B": ["A","D"] }
-    2) Envuelto:
-       { "type": "topo", "config": { "A": ["B","C"], ... } }
-    """
-    raw = load_json(path)
-    data = _unwrap_config(raw)
-    topo: Dict[str, List[str]] = {}
-    for k, v in data.items():
-        topo[k] = list(v)
-    return topo
+def load_topo(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # Acepta:
+    # 1) plano: {"A": ["B"], "B": ["A"]}
+    # 2) envuelto: {"type": "topo", "config": {...}}
+    if isinstance(data, dict) and "config" in data and isinstance(data["config"], dict):
+        return data["config"]
+    return data
+
 
 
 # ---------- Construcción / control de nodos ----------
 def build_nodes(names, topo, algo, transport="udp", redis_cfg=None):
-    nodes: Dict[str, Node] = {}
+    nodes = {}
 
+    # Protocolos permitidos
     allowed = {"lsr", "dvr", "flooding"}
     default_protocol = str(algo).lower()
     if default_protocol not in allowed:
         default_protocol = "lsr"
 
-    # Asegura que todos los que están en names existan en topo
+    # Asegurar que todos los nodos de 'names' existan en 'topo'
     for n in names.keys():
         topo.setdefault(n, [])
 
-    # Mapa lógico -> canal Redis (si no hay 'channel' en names, usa el nombre)
-    channel_map = {k: str(v.get("channel", k)) for k, v in names.items()}
+    # Mapa lógico -> canal Redis
+    if transport == "redis":
+        channel_map = {}
+        for k, v in names.items():
+            ch = v.get("channel")
+            if not ch:
+                raise ValueError(f"[Redis] Falta 'channel' para el nodo '{k}' en names-redis.json")
+            channel_map[k] = str(ch)
+    else:
+        # En UDP no usamos canales; dejamos identidad 1:1
+        channel_map = {k: k for k in names.keys()}
 
+    # Construcción de nodos
     for name, cfg in names.items():
         host = cfg["host"]
         port = int(cfg["port"])
         neighbors = topo.get(name, [])
 
-        # Override opcional de protocolo en names.json
+        # Protocolo por nodo (override opcional en names.json)
         node_protocol = str(cfg.get("protocol", default_protocol)).lower()
         if node_protocol not in allowed:
             node_protocol = default_protocol
 
-        # redis_cfg por nodo (solo si transport=redis)
+        # redis_cfg específico del nodo
         node_redis_cfg = None
         if transport == "redis":
             base = dict(redis_cfg or {})
@@ -138,6 +129,7 @@ def build_nodes(names, topo, algo, transport="udp", redis_cfg=None):
         )
 
     return nodes
+
 
 
 
@@ -224,6 +216,10 @@ def main():
     parser.add_argument("--warmup", type=float, default=3.0, help="Segundos de espera antes de enviar DATA")
     parser.add_argument("--after", type=float, default=3.0, help="Segundos de espera tras enviar DATA")
     parser.add_argument("--compare", action="store_true", help="Ejecutar comparación LSR vs DVR")
+    parser.add_argument("--redis-username", default="default")
+    parser.add_argument("--ping", action="store_true",
+                    help="Enviar HELLO/echo del --src a --dst y mostrar RTT")
+
 
     # --- flags de transporte (Parte 2) ---
     parser.add_argument("--transport", choices=["udp", "redis"], default="udp",
@@ -244,6 +240,7 @@ def main():
             "host": args.redis_host,
             "port": args.redis_port,
             "password": args.redis_password,
+            "username": args.redis_username,
             "decode_responses": True,
         }
 
@@ -359,6 +356,17 @@ def main():
                 print(f"[demo] Warmup {args.warmup:.1f}s (HELLO/vecinos)…")
             time.sleep(max(0.0, args.warmup))
 
+            # <<< AQUI VA EL PING >>>
+            if args.ping:
+                print(f"[demo] PING {args.src} → {args.dst} (HELLO/echo)…")
+                nodes[args.src].send_hello(args.dst)
+                time.sleep(1.0)  # da tiempo a que regrese el echo
+                rtt = nodes[args.src].neighbor_rtt_ms.get(args.dst)
+                if rtt is not None:
+                    print(f"[demo] RTT {args.src}↔{args.dst}: {rtt:.2f} ms")
+                else:
+                    print(f"[demo] RTT {args.src}↔{args.dst}: (sin medición)")
+
             if args.algo in ["lsr", "dvr"]:
                 print_tables(nodes)
 
@@ -369,6 +377,7 @@ def main():
 
         finally:
             stop_nodes(nodes)
+
 
 
 if __name__ == "__main__":

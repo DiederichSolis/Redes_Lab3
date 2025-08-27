@@ -1,0 +1,4 @@
+{
+  "A": { "host": "127.0.0.1", "port": 56001, "channel": "sec10.grupo4.cor22982" },
+  "B": { "host": "127.0.0.1", "port": 56002, "channel": "sec10.grupo7.sol22952" }
+}
