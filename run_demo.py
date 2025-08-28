@@ -23,6 +23,22 @@ import threading
 from typing import Dict, List
 
 
+try:
+    from rich.console import Console
+    console = Console()
+    def dprint(msg): console.print(msg)
+except Exception:
+    def dprint(msg): print(msg)
+# --- Emojis para logs vistosos ---
+ICON_OK = "🟢"
+ICON_NODE = "🟢"
+ICON_NEUTRAL = "⚪"
+ICON_SEND = "🚀"
+ICON_BROADCAST = "📡"
+ICON_WARN = "⚠️"
+ICON_ERR = "❌"
+
+
 # ---------- Utilidades para cargar archivos ----------
 def load_json(path: str) -> dict:
     p = Path(path)
@@ -147,7 +163,8 @@ def demo_send(
         return
 
     node_src = nodes[src]
-    print(f"[demo] Enviando DATA {algo.upper()} {src} → {dst}: '{text}' (ttl={ttl})")
+    dprint(f"[bold white on black][demo][/bold white on black] {ICON_SEND} Enviando [bold]DATA {algo.upper()}[/bold] "
+       f"[magenta]{src}[/magenta] → [cyan]{dst}[/cyan]: [yellow]'{text}'[/yellow] (ttl={ttl})")
 
     if algo == "flooding":
         node_src.send_data_flood(dst, text, ttl=ttl)
@@ -155,6 +172,59 @@ def demo_send(
         # LSR por defecto
         node_src.send_data(dst, text, ttl=ttl)
 
+
+def demo_broadcast(nodes: Dict[str, Node], src: str, text: str, ttl: int = 10) -> None:
+    """
+    Emula 'broadcast': desde 'src' envía por flooding un DATA por cada vecino destino lógico.
+    En node.py el flooding reenvía mientras m.dst != self.name, así que la red completa lo verá.
+    """
+    if src not in nodes:
+        print(f"ERROR: src inválido: {src}")
+        return
+    n = nodes[src]
+    for v in list(n.neighbors):
+        dprint(f"[bold white on black][demo][/bold white on black] {ICON_BROADCAST} Broadcast inicial a [green]{v}[/green]")
+        n.send_data_flood(v, text, ttl=ttl)
+
+def handle_cli_command(nodes: Dict[str, Node], src: str, cmd: str) -> None:
+    """
+    Intérprete de comandos simples:
+      - nodes
+      - broadcast <texto>
+      - send <DST> <texto>
+      - ping <DST>
+    """
+    cmd = cmd.strip()
+    if not cmd:
+        return
+
+    parts = cmd.split(maxsplit=2)
+    op = parts[0].lower()
+
+    if op == "nodes":
+        print("NODOS DISPONIBLES:")
+        for k, cfg in nodes[src].names.items():
+            ch = cfg.get("channel", "")
+            yo = "(YO) " if k == src else ""
+            print(f"  {yo}{k} -> {ch}")
+        return
+
+    if op == "broadcast" and len(parts) >= 2:
+        text = parts[1] if len(parts) == 2 else parts[1] + " " + parts[2]
+        demo_broadcast(nodes, src, text, ttl=10)
+        return
+
+    if op == "send" and len(parts) >= 3:
+        dst, text = parts[1], parts[2]
+        demo_send("flooding", nodes, src, dst, text, ttl=10)
+        return
+
+    if op == "ping" and len(parts) >= 2:
+        dst = parts[1]
+        nodes[src].send_hello(dst)
+        return
+
+    print(f"Comando no reconocido: {cmd}")
 
 # ---------- Manejo de Ctrl+C ----------
 def handle_sigint(nodes: Dict[str, Node]):
@@ -187,12 +257,14 @@ def handle_sigint(nodes: Dict[str, Node]):
 def start_nodes(nodes: Dict[str, Node]) -> None:
     for n in nodes.values():
         n.start()
-    print(f"[demo] {len(nodes)} nodos iniciados.")
+    # antes: print(f"[demo] {n} nodos iniciados.")
+    dprint(f"[bold white on black][demo][/bold white on black] [green]{n}[/green] nodos iniciados.")
+        
 
 def stop_nodes(nodes: Dict[str, Node]) -> None:
     for n in nodes.values():
         n.stop()
-    print("[demo] Nodos detenidos.")
+    dprint("[bold white on black][demo][/bold white on black] [green]Nodos detenidos.[/green]")
 
 def print_tables(nodes: Dict[str, Any]) -> None:
     print("\n[demo] Tablas de ruteo actuales:")
@@ -206,6 +278,12 @@ def print_tables(nodes: Dict[str, Any]) -> None:
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser(description="Run demo Lab 3 - Routing Protocols Comparison")
+    parser.add_argument("--no-demo", action="store_true", help="No enviar demo automática después del warmup")
+    parser.add_argument("--shell", action="store_true",
+                    help="Entrar a modo interactivo (prompt) tras el warmup")
+    parser.add_argument("--after-cmd", default="",
+                        help="Comando CLI para ejecutar tras el warmup (p.ej. 'broadcast HOLA')")
+
     parser.add_argument("--names", default="names-sample.json", help="Ruta a archivo JSON de nombres (host/port)")
     parser.add_argument("--topo", default="topo-sample.json", help="Ruta a archivo JSON de topología")
     parser.add_argument("--algo", choices=["lsr", "dvr", "flooding"], default="lsr", help="Algoritmo para DATA")
@@ -353,7 +431,7 @@ def main():
             if args.algo in ["lsr", "dvr"]:
                 print(f"[demo] Warmup {args.warmup:.1f}s para {args.algo.upper()} (emisión/recepción de mensajes de control + computación de rutas)…")
             else:
-                print(f"[demo] Warmup {args.warmup:.1f}s (HELLO/vecinos)…")
+                dprint("[bold white on black][demo][/bold white on black] Warmup 3.0s [yellow](HELLO/vecinos)[/yellow]…")
             time.sleep(max(0.0, args.warmup))
 
             # <<< AQUI VA EL PING >>>
@@ -370,10 +448,28 @@ def main():
             if args.algo in ["lsr", "dvr"]:
                 print_tables(nodes)
 
-            demo_send(args.algo, nodes, args.src, args.dst, args.text, args.ttl)
+                        # --- flujo tras warmup ---
+            # a) si pasaron un comando, ejecútalo (ej. --after-cmd "broadcast HOLA")
+            if args.after_cmd:
+                handle_cli_command(nodes, args.src, args.after_cmd)
 
-            if args.after > 0:
-                time.sleep(args.after)
+            # b) si pidieron shell, entra a modo interactivo
+            elif args.shell:
+                try:
+                    while True:
+                        cmd = input(f"[{args.src}]> ").strip()
+                        if cmd.lower() in ("q", "quit", "exit"):
+                            break
+                        handle_cli_command(nodes, args.src, cmd)
+                finally:
+                    stop_nodes(nodes)
+                    return
+
+            # c) si no, ejecuta la demo automática (una sola vez) y termina
+            else:
+                demo_send(args.algo, nodes, args.src, args.dst, args.text, args.ttl)
+
+
 
         finally:
             stop_nodes(nodes)

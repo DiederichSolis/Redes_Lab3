@@ -15,11 +15,46 @@ except Exception:
     from message import Message
     from dijkstra import dijkstra
 
+# --- pretty console ---
+try:
+    from rich.console import Console
+    from rich.table import Table
+    console = Console()
+except Exception:
+    Console = None
+    Table = None
+    console = None
+
+# emojis e íconos
+ICON_OK = "🟢"
+ICON_NODE = "🟢"
+ICON_NEUTRAL = "⚪"
+ICON_SEND = "🚀"
+ICON_BROADCAST = "📡"
+ICON_WARN = "⚠️"
+ICON_ERR = "❌"
+
+def cprint(msg: str):
+    if console:
+        console.print(msg)
+    else:
+        print(msg)
+
+def table_nodes(title: str, rows: list[tuple[str,str]]):
+    if not console or not Table:
+        for left, right in rows:
+            print(f"{left} {right}")
+        return
+    t = Table(title=title, show_header=False, box=None, pad_edge=False)
+    for left, right in rows:
+        t.add_row(left, right)
+    console.print(t)
+
+
 BUF = 65535
 
 
 class Node:
-
     # ---------------- init / infra ----------------
     def __init__(
         self,
@@ -30,7 +65,7 @@ class Node:
         neighbors: List[str],
         transport: str = "udp",
         redis_cfg: Optional[Dict[str, Any]] = None,
-        routing_protocol: Optional[str] = None,   # <-- nuevo
+        routing_protocol: Optional[str] = None,
     ) -> None:
         self.name = name
         self.host = bind_host
@@ -102,10 +137,12 @@ class Node:
         if self.transport == "redis":
             self._init_redis_config()
 
-
     # ---------------- Redis helpers ----------------
     def _init_redis_config(self) -> None:
-    
+        """
+        Inicializa configuración Redis y valida llaves requeridas.
+        No inicia hilos aquí; sólo prepara cliente y suscripción.
+        """
         if not isinstance(self.redis_cfg, dict):
             raise ValueError("[Redis] redis_cfg inválido")
         if "channel_self" not in self.redis_cfg:
@@ -113,42 +150,62 @@ class Node:
         if "channel_map" not in self.redis_cfg:
             raise ValueError("[Redis] Falta 'channel_map' en redis_cfg")
 
-        import redis
-
-        # Cliente autenticado por contraseña (todas las conexiones del pool quedan auth)
-        self.r = redis.Redis(
-            host=self.redis_cfg.get("host", "lab3.redesuvg.cloud"),
-            port=int(self.redis_cfg.get("port", 6379)),
-            username=self.redis_cfg.get("username") or None,
-            password=self.redis_cfg.get("password", None),
-            decode_responses=bool(self.redis_cfg.get("decode_responses", True)),
-        )
-
-        # Verificar conexión / autenticación
-        try:
-            self.r.ping()
-        except redis.exceptions.AuthenticationError as e:
-            raise ValueError(f"[Redis] Error de autenticación: {e}")
-        except Exception as e:
-            raise ValueError(f"[Redis] No se pudo conectar a Redis: {e}")
+        # Crea cliente y pubsub con auth
+        self._ensure_redis_client()
 
         # Canales
         self.redis_channel_self = str(self.redis_cfg["channel_self"])
         self.redis_channel_map = {k: str(v) for k, v in self.redis_cfg["channel_map"].items()}
 
-        # Pub/Sub y suscripción a canal propio
+        # Suscripción a canal propio (pubsub ya existe tras _ensure_redis_client)
+        try:
+            self.pubsub.subscribe(self.redis_channel_self)  # type: ignore
+        except Exception as e:
+            raise ValueError(f"[Redis] No se pudo suscribir a {self.redis_channel_self}: {e}")
+
+        cprint(f"[bold green][{self.name}][/bold green] Redis listo. Canal propio = [cyan]{self.redis_channel_self}[/cyan]")
+
+
+    def _ensure_redis_client(self) -> None:
+        """
+        Crea cliente Redis y pubsub si no existen. Importa 'redis' perezosamente.
+        Unifica auth con username/password.
+        """
+        if self.r is not None and self.pubsub is not None:
+            return
+
+        try:
+            import redis  # type: ignore
+        except Exception as e:
+            raise ImportError("Falta la dependencia 'redis'. Instálala con: pip install redis") from e
+
+        host = self.redis_cfg.get("host", "lab3.redesuvg.cloud")
+        port = int(self.redis_cfg.get("port", 6379))
+        username = self.redis_cfg.get("username") or None
+        password = self.redis_cfg.get("password") or None
+
+        self.r = redis.Redis(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            decode_responses=True,
+            health_check_interval=15,
+            socket_keepalive=True,
+            retry_on_timeout=True,
+        )
+
+        # Verificar conexión / autenticación
+        try:
+            self.r.ping()
+        except Exception as e:
+            # Reset si falló
+            self.r = None
+            self.pubsub = None
+            raise ValueError(f"[Redis] No se pudo conectar/autenticar: {e}")
+
+        # Pub/Sub base (suscripción al canal propio se hace en _init_redis_config)
         self.pubsub = self.r.pubsub(ignore_subscribe_messages=True)
-        self.pubsub.subscribe(self.redis_channel_self)
-
-        # Lanzar hilo listener (si no está corriendo)
-        if not getattr(self, "t_pubsub", None) or not self.t_pubsub or not self.t_pubsub.is_alive():
-            self.t_pubsub = threading.Thread(target=self._pubsub_loop, daemon=True)
-            self.t_pubsub.start()
-
-        print(f"[{self.name}] Redis listo. Canal propio='{self.redis_channel_self}'")
-
-
-
 
     def _pubsub_loop(self) -> None:
         """
@@ -157,63 +214,67 @@ class Node:
         - reintenta suscripción si cae la conexión
         - no loguea ni reintenta si estamos en shutdown
         """
-        import time
-        try:
-            import redis  # type: ignore
-        except Exception:
-            redis = None  # por si ya está importado arriba
-
         while not self.stop_event.is_set():
             try:
-                # (re)crear y suscribir si no existe
-                if self.pubsub is None:
+                # Asegurar cliente y pubsub vivos
+                if self.r is None or self.pubsub is None:
                     if self.stop_event.is_set():
                         break
-                    self.pubsub = self.r.pubsub(ignore_subscribe_messages=True)
-                    self.pubsub.subscribe(self.redis_channel_self)
-                    time.sleep(0.1)
+                    self._ensure_redis_client()
+                    # Re-suscribir a canal propio si es necesario
+                    if self.redis_channel_self:
+                        try:
+                            self.pubsub.subscribe(self.redis_channel_self)  # type: ignore
+                        except Exception:
+                            # se reintenta en el próximo ciclo
+                            time.sleep(0.2)
 
-                # lectura no bloqueante
-                msg = self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                # Lectura no bloqueante
+                msg = self.pubsub.get_message(timeout=0.8)  # type: ignore
                 if not msg:
-                    time.sleep(0.05)
                     continue
                 if msg.get("type") != "message":
                     continue
 
-                raw = msg.get("data")
-                if isinstance(raw, bytes):
+                data = msg.get("data")
+                if not data:
+                    continue
+
+                if isinstance(data, bytes):
                     try:
-                        raw = raw.decode("utf-8", "ignore")
+                        raw = data.decode("utf-8", "ignore")
                     except Exception:
                         continue
+                else:
+                    raw = str(data)
 
-                # encolar para el forwarding
+                # Encolar para el forwarding
                 self.incoming.put(raw)
 
-            except (AttributeError, OSError) as e:
-                # p.ej. "'NoneType' has no attribute 'get_message'" o "I/O operation on closed file"
+            except (AttributeError, OSError, ValueError) as e:
                 if self.stop_event.is_set():
                     break
-                print(f"[{self.name}] PubSub error: {e}. Reintentando…")
-                try:
-                    if self.pubsub:
-                        self.pubsub.close()
-                except Exception:
-                    pass
-                self.pubsub = None  # se recrea en el próximo ciclo
-                time.sleep(0.3)
-
-            except Exception as e:
-                if self.stop_event.is_set():
-                    break
-                print(f"[{self.name}] PubSub error: {e}. Reintentando…")
+                # Recrear cliente/pubsub
                 try:
                     if self.pubsub:
                         self.pubsub.close()
                 except Exception:
                     pass
                 self.pubsub = None
+                self.r = None
+                time.sleep(0.3)
+
+            except Exception:
+                if self.stop_event.is_set():
+                    break
+                # Reset y reintento
+                try:
+                    if self.pubsub:
+                        self.pubsub.close()
+                except Exception:
+                    pass
+                self.pubsub = None
+                self.r = None
                 time.sleep(0.3)
 
         # salida limpia
@@ -224,54 +285,6 @@ class Node:
             pass
         finally:
             self.pubsub = None
-
-    def send_hello(self, dst: str, ttl: int = 8) -> None:
-        import time
-        m = Message(
-            proto="sys",
-            type="hello",
-            src=self.name,
-            dst=dst,
-            ttl=ttl,
-            headers={"t0": time.time()},
-            payload={},
-            hops=0,
-        )
-        self.send(m)
-
-
-    def _ensure_redis_client(self) -> None:
-        """
-        Crea cliente Redis y pubsub si no existen. Importa 'redis' perezosamente.
-        """
-        if self.r is not None and self.pubsub is not None:
-            return
-        try:
-            import redis  # type: ignore
-        except Exception as e:
-            raise ImportError("Falta la dependencia 'redis'. Instálala con: pip install redis") from e
-
-        host = self.redis_cfg.get("host", "localhost")
-        port = int(self.redis_cfg.get("port", 6379))
-        pwd = self.redis_cfg.get("pwd")
-
-        # Conexión y ping
-        self.r = redis.Redis(host=host, port=port, password=pwd, decode_responses=True)
-        self.r.ping()
-
-        # PubSub suscrito a canal propio
-        self.pubsub = self.r.pubsub(ignore_subscribe_messages=True)
-        self.pubsub.subscribe(self.redis_channel_self)
-
-    def _resolve_channel(self, logical_name: str) -> Optional[str]:
-        """
-        Devuelve el canal Redis de un vecino lógico usando ÚNICAMENTE channel_map.
-        """
-        ch = self.redis_channel_map.get(logical_name)
-        if not ch:
-            print(f"[{self.name}] WARN Redis: no hay canal para '{logical_name}'. "
-                  f"Añádelo en redis_cfg['channel_map']. Envío omitido.")
-        return ch
 
     # ---------------- ciclo de vida ----------------
     def start(self) -> None:
@@ -286,8 +299,14 @@ class Node:
             self.t_listener = threading.Thread(target=self._listener_udp, daemon=True)
             self.t_listener.start()
         else:  # redis
+            # Asegura cliente y suscripción, luego un único loop de pubsub
             self._ensure_redis_client()
-            self.t_pubsub = threading.Thread(target=self._listener_redis, daemon=True)
+            if self.redis_channel_self:
+                try:
+                    self.pubsub.subscribe(self.redis_channel_self)  # type: ignore
+                except Exception:
+                    pass
+            self.t_pubsub = threading.Thread(target=self._pubsub_loop, daemon=True)
             self.t_pubsub.start()
 
         self.t_forward.start()
@@ -300,17 +319,10 @@ class Node:
         if self.stop_event.is_set():
             return
 
-        # 1) Señal de parada para que loops salgan solos
+        # 1) Señal de parada
         self.stop_event.set()
 
-        # 2) Dar un respiro corto para que detecten la señal
-        try:
-            import time
-            time.sleep(0.05)
-        except Exception:
-            pass
-
-        # 3) Unir hilos primero (así no usan recursos ya cerrados)
+        # 2) Unir hilos primero (así no usan recursos ya cerrados)
         for t in [self.t_forward, self.t_routing, self.t_hello, self.t_listener, self.t_pubsub]:
             if t and t.is_alive():
                 try:
@@ -318,7 +330,7 @@ class Node:
                 except Exception:
                     pass
 
-        # 4) Cerrar transports/sockets después de unir hilos
+        # 3) Cerrar transports/sockets después de unir hilos
         if self.transport == "udp":
             try:
                 if self.sock:
@@ -328,7 +340,6 @@ class Node:
             finally:
                 self.sock = None
         elif self.transport == "redis":
-            # Cierra pubsub y conexiones del pool
             try:
                 if self.pubsub:
                     self.pubsub.close()
@@ -344,31 +355,28 @@ class Node:
             finally:
                 self.r = None
 
-        # 5) Limpieza de refs a hilos
+        # 4) Limpieza de refs a hilos
         self.t_forward = None
         self.t_routing = None
         self.t_hello = None
         self.t_listener = None
         self.t_pubsub = None
 
-
-
     # ---------------- envío ----------------
     def send_raw(self, next_hop: str, raw_json: str) -> None:
-    
-        #next_hop es el nombre lógico del vecino.
-        #- Redis: publish al canal del vecino
-        #- UDP: sendto al (host, port) correspondiente
-        #Silencia errores cuando estamos en shutdown.
-        # No envíes nada si ya estamos parando
+        """
+        next_hop es el nombre lógico del vecino.
+        - Redis: publish al canal del vecino
+        - UDP: sendto al (host, port) correspondiente
+        Silencia errores cuando estamos en shutdown.
+        """
         if self.stop_event.is_set():
             return
 
         # Asegura string
         if not isinstance(raw_json, str):
             try:
-                import json as _json
-                raw_json = _json.dumps(raw_json)
+                raw_json = json.dumps(raw_json)
             except Exception:
                 raw_json = str(raw_json)
 
@@ -379,10 +387,12 @@ class Node:
                     print(f"[{self.name}] Canal Redis desconocido para '{next_hop}'")
                 return
             try:
-                self.r.publish(ch, raw_json)
+                self._ensure_redis_client()  # robustez ante reconexión
+                self.r.publish(ch, raw_json)  # type: ignore
             except Exception as e:
                 if not self.stop_event.is_set():
-                    print(f"[{self.name}] Error publish Redis -> {ch}: {e}")
+                    cprint(f"{ICON_ERR} [red][{self.name}][/red] publish Redis → [magenta]{ch}[/magenta]: {e}")
+
             return
 
         # --- UDP ---
@@ -400,69 +410,11 @@ class Node:
             if not self.stop_event.is_set():
                 print(f"[{self.name}] Error UDP sendto -> {next_hop}: {e}")
 
-
-
-    def _send_raw_udp(self, logical_name: str, json_str: str) -> None:
-        if self.sock is None:
-            return
+    def _sock_addr(self, logical_name: str) -> tuple[str, int]:
         cfg = self.names.get(logical_name)
         if not isinstance(cfg, dict) or "host" not in cfg or "port" not in cfg:
-            print(f"[{self.name}] UDP send_raw: destino inválido (se esperaba host/port) -> {logical_name}")
-            return
-        addr = (cfg["host"], int(cfg["port"]))
-        try:
-            self.sock.sendto(json_str.encode("utf-8"), addr)
-        except Exception as e:
-            if not self.stop_event.is_set():
-                print(f"[{self.name}] ERROR sendto({logical_name} {addr}): {e}")
-
-    def _send_raw_redis(self, logical_name: str, json_str: str) -> None:
-        if self.stop_event.is_set():
-            return
-        channel = self._resolve_channel(logical_name)
-        if not channel:
-            return
-
-        # Intento 1
-        try:
-            self._ensure_redis_client()
-            self.r.publish(channel, json_str)  # type: ignore
-            return
-        except Exception as e:
-            if self.stop_event.is_set():
-                return
-            print(f"[{self.name}] Redis publish falló (1er intento): {e}. Reintentando…")
-
-        # Reintento con reconexión
-        try:
-            self.r = None
-            self.pubsub = None
-            self._ensure_redis_client()
-            self.r.publish(channel, json_str)  # type: ignore
-        except Exception as e:
-            if not self.stop_event.is_set():
-                print(f"[{self.name}] ERROR publish({channel}) tras reintento: {e}")
-
-    def send(self, m: Message) -> None:
-        """
-        Enrutador de alto nivel.
-        - Para LSR/DATA: decide next hop por routing_table; si no hay, broadcast.
-        - Para otros, si 'dst' es vecino lógico, envía directo; si no, broadcast.
-        """
-        if m.proto == "lsr" and m.type == "data":
-            nh = self._next_hop_for(m.dst)
-            if nh is None:
-                for v in self.neighbors:
-                    self.send_raw(v, m.to_json())
-                return
-            self.send_raw(nh, m.to_json())
-            return
-
-        if m.dst in self.neighbors:
-            self.send_raw(m.dst, m.to_json())
-        else:
-            for v in self.neighbors:
-                self.send_raw(v, m.to_json())
+            raise ValueError(f"Destino inválido (se esperaba host/port) -> {logical_name}")
+        return (cfg["host"], int(cfg["port"]))
 
     # ---------------- listeners ----------------
     def _listener_udp(self) -> None:
@@ -484,48 +436,6 @@ class Node:
                 continue
             self.incoming.put(raw)
 
-    def _listener_redis(self) -> None:
-        try:
-            self._ensure_redis_client()
-        except Exception as e:
-            if not self.stop_event.is_set():
-                print(f"[{self.name}] listener Redis no pudo conectar: {e}")
-            return
-
-        while not self.stop_event.is_set():
-            try:
-                msg = self.pubsub.get_message(timeout=0.5)  # type: ignore
-            except Exception as e:
-                if self.stop_event.is_set():
-                    break
-                print(f"[{self.name}] pubsub error: {e}. Reintentando suscripción…")
-                time.sleep(0.5)
-                try:
-                    self.r = None
-                    self.pubsub = None
-                    self._ensure_redis_client()
-                except Exception:
-                    pass
-                continue
-
-            if not msg:
-                continue
-            if msg.get("type") != "message":
-                continue
-
-            data = msg.get("data")
-            if not data:
-                continue
-            if isinstance(data, str):
-                raw = data
-            else:
-                try:
-                    raw = data.decode("utf-8")  # bytes
-                except Exception:
-                    continue
-
-            self.incoming.put(raw)
-
     # ---------------- forwarding ----------------
     def _forwarding_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -538,7 +448,7 @@ class Node:
             try:
                 m = Message.from_json(raw)
             except Exception as e:
-                print(f"[{self.name}] paquete inválido: {raw[:80]}... err={e}")
+                cprint(f"{ICON_ERR} [red][{self.name}][/red] paquete inválido: {raw[:80]}… err={e}")
                 continue
 
             # ---------- Normalización y actualización de TTL/HOPS ----------
@@ -659,7 +569,6 @@ class Node:
                 print(f"[{self.name}] INFO: {m.payload}")
                 continue
 
-
     # ---------------- routing (Dijkstra + LSP emit) ----------------
     def _routing_loop(self) -> None:
         """
@@ -761,12 +670,49 @@ class Node:
     def _deliver(self, m: Message) -> None:
         # imprime hops y payload bonito
         try:
-            import json
             payload_str = json.dumps(m.payload)
         except Exception:
             payload_str = str(m.payload)
-        print(f"[{self.name}] DATA entregado de {m.src} → {m.dst} (hops={getattr(m, 'hops', '?')}) | payload={payload_str}")
+        cprint(
+        f"[bold green][{self.name}][/bold green] DATA entregado "
+        f"de [magenta]{m.src}[/magenta] → [cyan]{m.dst}[/cyan] "
+        f"(hops={getattr(m,'hops','?')}) | payload={payload_str}"
+        )
 
+
+    def send(self, m: Message) -> None:
+        """
+        Enrutador de alto nivel.
+        - Para LSR/DATA: decide next hop por routing_table; si no hay, broadcast.
+        - Para otros, si 'dst' es vecino lógico, envía directo; si no, broadcast.
+        """
+        if m.proto == "lsr" and m.type == "data":
+            nh = self._next_hop_for(m.dst)
+            if nh is None:
+                for v in self.neighbors:
+                    self.send_raw(v, m.to_json())
+                return
+            self.send_raw(nh, m.to_json())
+            return
+
+        if m.dst in self.neighbors:
+            self.send_raw(m.dst, m.to_json())
+        else:
+            for v in self.neighbors:
+                self.send_raw(v, m.to_json())
+
+    def send_hello(self, dst: str, ttl: int = 8) -> None:
+        m = Message(
+            proto="sys",
+            type="hello",
+            src=self.name,
+            dst=dst,
+            ttl=ttl,
+            headers={"t0": time.time()},
+            payload={},
+            hops=0,
+        )
+        self.send(m)
 
     def send_data(self, dst: str, text: str, ttl: int = 12) -> None:
         if self.routing_protocol == "flooding":
@@ -784,7 +730,6 @@ class Node:
         )
         self.send(m)
 
-
     def send_data_flood(self, dst: str, text: str, ttl: int = 12) -> None:
         msg_id = f"{self.name}-{int(time.time() * 1000)}-{random.randint(0, 9999)}"
         m = Message(
@@ -797,13 +742,32 @@ class Node:
             payload={"text": text},
         )
         for v in list(self.neighbors):
+            # 👇 El log debe ir DENTRO del bucle, ya con v definido
+            try:
+                ch = (self.redis_channel_map or {}).get(v)
+            except Exception:
+                ch = None
+            if 'cprint' in globals():
+                cprint(f"[{self.name}] {ICON_SEND} enviando inicial a [green]{v}[/green]{' ('+str(ch)+')' if ch else ''}")
             self.send_raw(v, m.to_json())
+
 
     # ---------------- helpers opcionales ----------------
     def _set_link_cost(self, u: str, v: str, cost: float) -> None:
         self.graph.setdefault(u, {})
         self.graph.setdefault(v, {})
         self.graph[u][v] = float(cost)
+
+    def print_nodes(self):
+        rows = []
+        for k, cfg in self.names.items():
+            icon = ICON_NODE if k == self.name else ICON_NEUTRAL
+            canal = cfg.get("channel", cfg.get("chan", ""))
+            left = f"{icon} {('[bold](YO)[/bold] ' if k==self.name else '')}{k}"
+            right = f"→ {canal}"
+            rows.append((left, right))
+        table_nodes("NODOS DISPONIBLES", rows)
+
 
     def _next_hop_for(self, dest: str) -> Optional[str]:
         if dest == self.name:
