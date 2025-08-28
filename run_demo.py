@@ -39,6 +39,96 @@ ICON_WARN = "⚠️"
 ICON_ERR = "❌"
 
 
+
+# --- pretty console helpers ---
+try:
+    from rich.console import Console
+    from rich.table import Table
+    _console = Console()
+except Exception:
+    _console = None
+    Table = None
+
+def _print(msg: str):
+    if _console:
+        _console.print(msg)
+    else:
+        print(msg)
+
+def cli_show_routes(nodes, src: str):
+    """Muestra la tabla de ruteo del nodo `src` (LSR/Dijkstra)."""
+    n = nodes[src]
+    rt = getattr(n, "routing_table", {}) or {}
+    proto = getattr(n, "routing_protocol", "unknown").upper()
+
+    if _console and Table:
+        table = Table(title=f"🗺️  Tabla de Enrutamiento de {src}  ({proto})",
+                      header_style="bold cyan")
+        table.add_column("Destino", justify="center", style="magenta")
+        table.add_column("Next-Hop", justify="center", style="green")
+        table.add_column("Costo (enlace directo)", justify="center", style="yellow")
+
+        for dest, nh in sorted(rt.items()):
+            # Para costo mostramos el costo del primer enlace (src->nh) si existe
+            cost = "—"
+            try:
+                cost_val = n.graph.get(src, {}).get(nh)
+                if cost_val is not None:
+                    cost = f"{float(cost_val):.1f}"
+            except Exception:
+                pass
+            table.add_row(dest, nh, str(cost))
+
+        if not rt:
+            table.add_row("—", "—", "—")
+
+        _console.print(table)
+    else:
+        print(f"Tabla de Enrutamiento de {src} ({proto})")
+        if not rt:
+            print("  (vacía)")
+        for dest, nh in sorted(rt.items()):
+            cost_val = n.graph.get(src, {}).get(nh, "—")
+            print(f"  {dest:>3}  ->  {nh:>3}   costo={cost_val}")
+
+def cli_show_lsdb(nodes, src: str):
+    """Muestra la 'LSDB' vista por `src`: n.graph = {u:{v:costo}}."""
+    n = nodes[src]
+    lsdb = getattr(n, "graph", {}) or {}
+
+    if _console and Table:
+        table = Table(title=f"📚  LSDB vista por {src}", header_style="bold magenta")
+        table.add_column("Nodo", style="cyan", justify="center")
+        table.add_column("Vecino", style="green", justify="center")
+        table.add_column("Costo", style="yellow", justify="center")
+
+        if not lsdb:
+            table.add_row("—", "—", "—")
+        else:
+            for u, nbrs in sorted(lsdb.items()):
+                if not nbrs:
+                    table.add_row(u, "—", "—")
+                else:
+                    for v, w in sorted(nbrs.items()):
+                        try:
+                            w = float(w)
+                        except Exception:
+                            pass
+                        table.add_row(u, v, f"{w}")
+        _console.print(table)
+    else:
+        print(f"LSDB vista por {src}")
+        if not lsdb:
+            print("  (vacía)")
+        else:
+            for u, nbrs in sorted(lsdb.items()):
+                if not nbrs:
+                    print(f"  {u}: (sin vecinos)")
+                else:
+                    for v, w in sorted(nbrs.items()):
+                        print(f"  {u} -> {v}   costo={w}")
+
+
 # ---------- Utilidades para cargar archivos ----------
 def load_json(path: str) -> dict:
     p = Path(path)
@@ -62,6 +152,65 @@ def _unwrap_config(obj: dict) -> dict:
 
 
 import json
+
+
+def cli_show_routes(nodes, src):
+    from rich.console import Console
+    from rich.table import Table
+
+    n = nodes[src]
+    rt = getattr(n, "routing_table", {}) or {}
+    proto = getattr(n, "routing_protocol", "unknown").upper()
+
+    console = Console()
+    table = Table(title=f"🗺️  Tabla de Enrutamiento de {src}  ({proto})",
+                  header_style="bold cyan")
+    table.add_column("Destino", justify="center", style="magenta")
+    table.add_column("Next-Hop", justify="center", style="green")
+    table.add_column("Costo", justify="center", style="yellow")
+
+    # costo = 1 si hay enlace directo en n.graph; si no, deja “—”
+    for dest, nh in sorted(rt.items()):
+        cost = "—"
+        try:
+            cost_val = n.graph.get(src, {}).get(nh)
+            if cost_val is not None:
+                cost = f"{cost_val:.1f}"
+        except Exception:
+            pass
+        table.add_row(dest, nh, str(cost))
+
+    if not rt:
+        table.add_row("—", "—", "—")
+
+    console.print(table)
+
+def cli_show_lsdb(nodes, src):
+    from rich.console import Console
+    from rich.table import Table
+
+    n = nodes[src]
+    # Usamos n.graph como “LSDB” simple: {node: {vecino: costo}}
+    lsdb = getattr(n, "graph", {}) or {}
+
+    console = Console()
+    table = Table(title=f"📚  LSDB de {src}", header_style="bold magenta")
+    table.add_column("Nodo", style="cyan", justify="center")
+    table.add_column("Vecino", style="green", justify="center")
+    table.add_column("Costo", style="yellow", justify="center")
+
+    if not lsdb:
+        table.add_row("—", "—", "—")
+    else:
+        for u, nbrs in sorted(lsdb.items()):
+            if not nbrs:
+                table.add_row(u, "—", "—")
+            else:
+                for v, w in sorted(nbrs.items()):
+                    table.add_row(u, v, f"{float(w):.1f}")
+
+    console.print(table)
+
 
 def load_names(path: str):
     with open(path, "r", encoding="utf-8") as f:
@@ -163,7 +312,7 @@ def demo_send(
         return
 
     node_src = nodes[src]
-    dprint(f"[bold white on black][demo][/bold white on black] {ICON_SEND} Enviando [bold]DATA {algo.upper()}[/bold] "
+    dprint(f"[bold white on black][demo][/bold white on black] {ICON_SEND} Enviando [bold]MESSAGE {algo.upper()}[/bold] "
        f"[magenta]{src}[/magenta] → [cyan]{dst}[/cyan]: [yellow]'{text}'[/yellow] (ttl={ttl})")
 
     if algo == "flooding":
@@ -175,7 +324,7 @@ def demo_send(
 
 def demo_broadcast(nodes: Dict[str, Node], src: str, text: str, ttl: int = 10) -> None:
     """
-    Emula 'broadcast': desde 'src' envía por flooding un DATA por cada vecino destino lógico.
+    Emula 'broadcast': desde 'src' envía por flooding un MESSAGE por cada vecino destino lógico.
     En node.py el flooding reenvía mientras m.dst != self.name, así que la red completa lo verá.
     """
     if src not in nodes:
@@ -228,6 +377,18 @@ def handle_cli_command(nodes: Dict[str, Node], src: str, cmd: str) -> None:
         text = parts[1] if len(parts) == 2 else parts[1] + " " + parts[2]
         demo_broadcast(nodes, src, text, ttl=10)
         return
+    
+    if op == "show" and len(parts) >= 2:
+        what = parts[1].lower()
+        if what == "routes":
+            cli_show_routes(nodes, src)
+            return
+        if what == "lsdb":
+            cli_show_lsdb(nodes, src)
+            return
+
+    if op in ("q", "quit", "exit"):
+        return 
 
     if op == "send" and len(parts) >= 3:
         dst, text = parts[1], parts[2]
@@ -237,6 +398,34 @@ def handle_cli_command(nodes: Dict[str, Node], src: str, cmd: str) -> None:
     if op == "ping" and len(parts) >= 2:
         dst = parts[1]
         nodes[src].send_hello(dst)
+        return
+    
+    if op == "show" and len(parts) >= 2:
+        what = parts[1].lower()
+        if what == "routes":
+            cli_show_routes(nodes, src)
+            return
+        if what == "lsdb":
+            cli_show_lsdb(nodes, src)
+            return
+    
+    if op == "show" and len(parts) >= 2:
+        what = parts[1].lower()
+        if what == "dv":
+            n = nodes[src]
+            try:
+                from router.node import print_dv_table  # o import al inicio
+            except Exception:
+                pass
+            print_dv_table(n)
+            return
+
+
+
+    # (opcional) 'show routes all'
+    if op == "show" and len(parts) >= 3 and parts[1].lower() == "routes" and parts[2].lower() == "all":
+        for k in sorted(nodes.keys()):
+            cli_show_routes(nodes, k)
         return
 
     print(f"Comando no reconocido: {cmd}")
@@ -328,6 +517,14 @@ def main():
 
     # --- bloque Redis cfg (solo si transport=redis) ---
     redis_cfg = None
+    
+    if args.algo == "dvr":
+        try:
+            from router.node import print_dv_table
+            print_dv_table(nodes[args.src])
+        except Exception:
+            pass
+
     if args.transport == "redis":
         redis_cfg = {
             "host": args.redis_host,
@@ -393,13 +590,13 @@ def main():
                 print(f"{k} ({protocol}) → {n.routing_table}")
 
             print("\n[demo] ===== ENVIANDO DATOS =====")
-            print("[demo] Enviando DATA A→D usando LSR...")
+            print("[demo] Enviando MESSAGE A→D usando LSR...")
             nodes["A"].send_data("D", "Hola desde A usando LSR", ttl=10)
 
-            print("[demo] Enviando DATA C→A usando DVR...")
+            print("[demo] Enviando MESSAGE C→A usando DVR...")
             nodes["C"].send_data("A", "Hola desde C usando DVR", ttl=10)
 
-            print("[demo] Enviando DATA B→C usando Flooding...")
+            print("[demo] Enviando MESSAGE B→C usando Flooding...")
             nodes["B"].send_data_flood("C", "Hola desde B usando Flooding", ttl=10)
 
             print("\n[demo] ===== MONITOREO CONTINUO =====")
@@ -448,6 +645,17 @@ def main():
             else:
                 dprint("[bold white on black][demo][/bold white on black] Warmup 3.0s [yellow](HELLO/vecinos)[/yellow]…")
             time.sleep(max(0.0, args.warmup))
+            # en run_demo.py, después del warmup:
+
+            if args.algo == "lsr":
+                _print("[bold white on black][demo][/bold white on black] Mostrando LSDB y rutas (LSR)…")
+                # Para el nodo fuente:
+                try:
+                    cli_show_lsdb(nodes, args.src)
+                    cli_show_routes(nodes, args.src)
+                except Exception:
+                    pass
+
 
             # <<< AQUI VA EL PING >>>
             if args.ping:

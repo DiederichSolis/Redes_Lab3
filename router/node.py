@@ -34,6 +34,17 @@ ICON_BROADCAST = "📡"
 ICON_WARN = "⚠️"
 ICON_ERR = "❌"
 
+
+def hdr_get(headers, key, default=None):
+    if isinstance(headers, list):
+        for h in headers:
+            if key in h:
+                return h[key]
+    return default
+
+def hdr_make(**kwargs):
+    return [{k: v} for k, v in kwargs.items()]
+
 def cprint(msg: str):
     if console:
         console.print(msg)
@@ -53,9 +64,59 @@ def table_nodes(title: str, rows: list[tuple[str,str]]):
 
 BUF = 65535
 
+# --- helpers para headers tipo lista ---
+HeadersType = List[Dict[str, Any]]
+
+def header_get(headers: HeadersType, key: str, default=None):
+    for h in headers:
+        if isinstance(h, dict) and key in h:
+            return h[key]
+    return default
+
+def header_set(headers: HeadersType, key: str, value):
+    for h in headers:
+        if isinstance(h, dict) and key in h:
+            h[key] = value
+            return
+    headers.append({key: value})
+
+def ttl_get(headers: HeadersType, default=8) -> int:
+    try:
+        return int(header_get(headers, "ttl", default))
+    except Exception:
+        return default
+
+def ttl_dec(headers: HeadersType) -> int:
+    t = ttl_get(headers, 8) - 1
+    header_set(headers, "ttl", t)
+    return t
+
+def print_dv_table(n: "Node") -> None:
+    rows = []
+    for d in sorted(n.dv_dist.keys()):
+        dist = n.dv_dist.get(d, n.DV_INF)
+        nh = n.dv_next.get(d)
+        dist_s = "∞" if dist >= n.DV_INF else f"{dist:.1f}"
+        rows.append((d, nh or "—", dist_s))
+
+    if console and Table:
+        t = Table(title=f"📬  Distance Vector de {n.name}", header_style="bold cyan")
+        t.add_column("Destino", justify="center", style="magenta")
+        t.add_column("Next-Hop", justify="center", style="green")
+        t.add_column("Distancia", justify="center", style="yellow")
+        if not rows:
+            t.add_row("—", "—", "—")
+        else:
+            for d, nh, dist_s in rows:
+                t.add_row(d, nh, dist_s)
+        console.print(t)
+    else:
+        print(f"Distance Vector de {n.name}")
+        for d, nh, dist_s in rows:
+            print(f"  {d:>3} -> {nh:>3}  dist={dist_s}")
+
 
 class Node:
-    # ---------------- init / infra ----------------
     def __init__(
         self,
         name: str,
@@ -67,49 +128,53 @@ class Node:
         redis_cfg: Optional[Dict[str, Any]] = None,
         routing_protocol: Optional[str] = None,
     ) -> None:
+        # ---------------- básicos ----------------
         self.name = name
         self.host = bind_host
         self.port = bind_port
         self.addr = (bind_host, bind_port)
 
-        # Vecinos lógicos
-        self.neighbors: Set[str] = set(neighbors)
-
-        # Mapa de nombres
+        # ---------------- vecinos / nombres ----------------
+        self.neighbors: Set[str] = set(neighbors)   # 👈 primero
         self.names: Dict[str, Any] = names
 
-        # Transporte
+        # ---------------- DVR ----------------
+        self.DV_INF = 1e9
+        self.dv_dist: Dict[str, float] = {self.name: 0.0}
+        self.dv_next: Dict[str, Optional[str]] = {}
+        self.dv_peer_vectors: Dict[str, Dict[str, float]] = {}
+        self.dv_period = 3.0
+
+        # ---------------- estado de vecinos ----------------
+        self.LINK_DOWN_COST = 1e9
+        self.last_seen: Dict[str, float] = {v: 0.0 for v in self.neighbors}
+        self.neighbor_up: Dict[str, bool] = {v: True for v in self.neighbors}
+        self.last_hello: Dict[str, float] = {}
+
+        # ---------------- transporte ----------------
         self.transport: str = transport.lower().strip()
         if self.transport not in ("udp", "redis"):
             raise ValueError("transport debe ser 'udp' o 'redis'")
 
-        # ---------------- routing ----------------
-        # normaliza y valida el protocolo: lsr | dvr | flooding
+        # ---------------- protocolo ----------------
         rp = (routing_protocol or "lsr").lower().strip()
         allowed = {"lsr", "dvr", "flooding"}
         if rp not in allowed:
-            raise ValueError(
-                f"routing_protocol inválido '{rp}'. Usa uno de {sorted(allowed)}"
-            )
+            raise ValueError(f"routing_protocol inválido '{rp}'. Usa uno de {sorted(allowed)}")
         self.routing_protocol: str = rp
 
-        # Grafo dirigido con pesos: {u: {v: w, ...}}
-        self.graph: Dict[str, Dict[str, float]] = {}
-        self.graph[self.name] = {}
+        # ---------------- grafo base ----------------
+        self.graph: Dict[str, Dict[str, float]] = {self.name: {}}
         for v in self.neighbors:
-            self.graph[self.name][v] = 1.0  # costo base
+            self.graph[self.name][v] = 1.0
 
-        # Tabla de ruteo (next hop por destino)
         self.routing_table: Dict[str, str] = {}
 
-        # Control de duplicados
+        # ---------------- varios ----------------
         self.seen_lsp_ids: Set[str] = set()
         self.seen_flood_ids: Set[str] = set()
-
-        # RTT por vecino
         self.neighbor_rtt_ms: Dict[str, float] = {}
 
-        # Colas / sincronización
         self.incoming: "queue.Queue[str]" = queue.Queue()
         self.stop_event = threading.Event()
 
@@ -120,22 +185,49 @@ class Node:
         self.t_routing = None
         self.t_hello = None
 
-        # UDP socket (sólo si transport=udp)
+        # UDP socket
         self.sock: Optional[socket.socket] = None
         if self.transport == "udp":
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.bind(self.addr)
             self.sock.settimeout(0.5)
 
-        # Redis (sólo si transport=redis)
-        self.r = None            # redis.Redis
-        self.pubsub = None       # redis.client.PubSub
+        # Redis
+        self.r = None
+        self.pubsub = None
         self.redis_cfg = redis_cfg or {}
         self.redis_channel_self: Optional[str] = None
         self.redis_channel_map: Dict[str, str] = {}
-
         if self.transport == "redis":
             self._init_redis_config()
+
+
+    def _link_bring_down(self, v: str) -> None:
+        if not self.neighbor_up.get(v, True):
+            return
+        self.neighbor_up[v] = False
+        # costo “infinito” hacia ese vecino
+        self.graph.setdefault(self.name, {})[v] = self.LINK_DOWN_COST
+        cprint(f"[{self.name}] ⚠️  Vecino [yellow]{v}[/yellow] TIMEOUT → enlace DOWN")
+        # re-cálculo y anuncio
+        if self.routing_protocol == "lsr":
+            self._recompute_routes()
+            self._emit_lsp()
+        elif self.routing_protocol == "dvr":
+            self._dvr_recompute()
+
+    def _link_bring_up(self, v: str) -> None:
+        if self.neighbor_up.get(v, True):
+            return
+        self.neighbor_up[v] = True
+        # restablece costo normal
+        self.graph.setdefault(self.name, {})[v] = 1.0
+        cprint(f"[{self.name}] 🟢  Vecino [green]{v}[/green] de vuelta → enlace UP")
+        if self.routing_protocol == "lsr":
+            self._recompute_routes()
+            self._emit_lsp()
+        elif self.routing_protocol == "dvr":
+            self._dvr_recompute()
 
     # ---------------- Redis helpers ----------------
     def _init_redis_config(self) -> None:
@@ -293,6 +385,9 @@ class Node:
         self.t_forward = threading.Thread(target=self._forwarding_loop, daemon=True)
         self.t_routing = threading.Thread(target=self._routing_loop, daemon=True)
         self.t_hello = threading.Thread(target=self._hello_loop, daemon=True)
+        self.t_monitor = threading.Thread(target=self._monitor_neighbors, daemon=True)
+        self.t_monitor.start()
+
 
         # Listener según transporte
         if self.transport == "udp":
@@ -361,6 +456,40 @@ class Node:
         self.t_hello = None
         self.t_listener = None
         self.t_pubsub = None
+
+    def _monitor_neighbors(self) -> None:
+        """
+        Detecta fallas de vecinos usando HELLO timeout (~8s).
+        Si cae: quita enlace y dispara LSP/DV update.
+        Si reaparece: restaura enlace.
+        """
+        timeout = 8.0
+        while not self.stop_event.is_set():
+            now = time.time()
+            for v in list(self.neighbors):
+                last = self.last_hello.get(v, 0)
+                alive = (now - last) < timeout
+
+                if not alive:
+                    # vecino caído
+                    if self.graph.get(self.name, {}).get(v) != self.DV_INF:
+                        self.graph[self.name][v] = self.DV_INF
+                        cprint(f"{ICON_WARN} [{self.name}] Vecino {v} INACTIVO → costo ∞")
+                        if self.routing_protocol == "lsr":
+                            self._emit_lsp()
+                        elif self.routing_protocol == "dvr":
+                            self._emit_dv()
+                else:
+                    # vecino vivo, restaurar costo si estaba en ∞
+                    if self.graph.get(self.name, {}).get(v, self.DV_INF) >= self.DV_INF:
+                        self.graph[self.name][v] = 1.0
+                        cprint(f"{ICON_OK} [{self.name}] Vecino {v} restaurado → costo 1.0")
+                        if self.routing_protocol == "lsr":
+                            self._emit_lsp()
+                        elif self.routing_protocol == "dvr":
+                            self._emit_dv()
+
+            time.sleep(2.0)
 
     # ---------------- envío ----------------
     def send_raw(self, next_hop: str, raw_json: str) -> None:
@@ -458,43 +587,49 @@ class Node:
             except Exception:
                 m.hops = 1
 
-            # TTL: si llega agotado, descarta; si no, decrementa
-            try:
-                m.ttl = int(getattr(m, "ttl", 8))
-            except Exception:
-                m.ttl = 8
-            if m.ttl <= 0:
+            # TTL en headers
+            if ttl_dec(m.headers) < 0:
                 continue
-            m.ttl -= 1
+
             # ---------------------------------------------------------------
 
             # --- HELLO/ECHO ---
+                      
             if m.type == "hello":
                 if m.dst == self.name:
+                    # marca vivo al vecino
+                    self.last_seen[m.src] = time.time()
+                    self._link_bring_up(m.src)
+
+                    t0 = header_get(m.headers, "t0", 0.0)
                     echo = Message(
-                        proto=m.proto or "sys",
                         type="echo",
                         src=self.name,
                         dst=m.src,
-                        ttl=8,
-                        headers={"t0": m.headers.get("t0", 0.0)},
-                        payload={},
-                        hops=0,  # nuevo mensaje de respuesta
+                        hops=0,
+                        headers=[{"t0": t0}, {"ttl": 8}],
+                        payload=""
                     )
                     self.send(echo)
                 continue
 
             if m.type == "echo" and m.dst == self.name:
+                # marca vivo al vecino
+                self.last_seen[m.src] = time.time()
+                self._link_bring_up(m.src)
+
                 try:
-                    t0 = float(m.headers.get("t0", 0.0))
+                    t0 = float(header_get(m.headers, "t0", 0.0))
                 except Exception:
                     t0 = 0.0
                 rtt_ms = max(0.0, (time.time() - t0) * 1000.0)
                 self.neighbor_rtt_ms[m.src] = rtt_ms
                 continue
 
+
+
             # --- LSR: LSP reception/flood ---
-            if m.proto == "lsr" and m.type == "lsp":
+            if m.type == "lsp":
                 lsp: Dict[str, Any] = m.payload or {}
                 lsp_id = str(lsp.get("id", ""))
                 node = str(lsp.get("node", ""))
@@ -508,30 +643,39 @@ class Node:
                     self.graph[node] = {}
                 self.graph[node].update({str(k): float(v) for k, v in links.items()})
 
-                came_from = m.headers.get("came_from")
+                came_from = header_get(m.headers, "came_from")
                 for v in self.neighbors:
                     if v == came_from:
                         continue
                     fwd = Message(
-                        proto="lsr",
                         type="lsp",
                         src=self.name,
                         dst=v,
-                        ttl=m.ttl,
-                        headers={"came_from": self.name},
-                        payload=lsp,
-                        hops=m.hops,  # propaga hops actualizados
+                        hops=m.hops,
+                        headers=[{"came_from": self.name}, {"ttl": ttl_get(m.headers)}],
+                        payload=lsp
                     )
                     self.send_raw(v, fwd.to_json())
                 continue
 
-            # --- FLOODING: DATA ---
-            if m.proto == "flooding" and m.type == "data":
-                msg_id = str(m.headers.get("id", ""))
-                came_from = m.headers.get("came_from")
-                if not msg_id:
-                    continue
-                if msg_id in self.seen_flood_ids:
+                        # --- DVR: anuncio de vector ---
+            if m.type == "dv_announcement":
+                vec = {}
+                try:
+                    rawv = m.payload.get("vector", {})
+                    if isinstance(rawv, dict):
+                        vec = {str(k): float(v) for k, v in rawv.items()}
+                except Exception:
+                    vec = {}
+                self.dv_peer_vectors[m.src] = vec
+                self._dvr_recompute()
+                continue
+
+                        # --- FLOODING: mensaje con id/came_from ---
+            if m.type == "message" and header_get(m.headers, "id") is not None:
+                msg_id = str(header_get(m.headers, "id", ""))
+                came_from = header_get(m.headers, "came_from")
+                if not msg_id or msg_id in self.seen_flood_ids:
                     continue
                 self.seen_flood_ids.add(msg_id)
 
@@ -543,54 +687,90 @@ class Node:
                     if v == came_from:
                         continue
                     fwd = Message(
-                        proto="flooding",
-                        type="data",
+                        type="message",
                         src=self.name,
                         dst=m.dst,
-                        ttl=m.ttl,
-                        headers={"id": msg_id, "came_from": self.name},
+                        hops=m.hops,
+                        headers=[
+                            {"id": msg_id},
+                            {"came_from": self.name},
+                            {"ttl": ttl_get(m.headers)},
+                        ],
                         payload=m.payload,
-                        hops=m.hops,  # propaga hops
                     )
                     self.send_raw(v, fwd.to_json())
                 continue
 
-            # --- DATA genérico (LSR/DVR) ---
-            if m.type == "data":
+
+
+
+            # --- FLOODING: DATA ---
+            if header_get(m.headers, "proto") == "flooding" and m.type == "message":
+                msg_id = str(header_get(m.headers, "id", ""))
+                came_from = header_get(m.headers, "came_from")
+                if not msg_id or msg_id in self.seen_flood_ids:
+                    continue
+                self.seen_flood_ids.add(msg_id)
+
                 if m.dst == self.name:
-                    self._deliver(m)  # entrega final (usa m.hops actualizado)
-                else:
-                    # Reenvío: 'send' decide next-hop y usa m.to_json() internamente
-                    self.send(m)
+                    self._deliver(m)
+                    continue
+
+                for v in self.neighbors:
+                    if v == came_from:
+                        continue
+                    fwd = Message(
+                        type="message",
+                        src=self.name,
+                        dst=m.dst,
+                        hops=m.hops,
+                        headers=[
+                            {"proto": "flooding"},
+                            {"id": msg_id},
+                            {"came_from": self.name},
+                            {"ttl": ttl_get(m.headers)}
+                        ],
+                        payload=m.payload
+                    )
+                    self.send_raw(v, fwd.to_json())
                 continue
+
+                        # --- DVR: anuncio de vector ---
+            if m.proto == "dvr" and m.type == "dv_announcement":
+                vec = {}
+                try:
+                    rawv = m.payload.get("vector", {})
+                    if isinstance(rawv, dict):
+                        vec = {str(k): float(v) for k, v in rawv.items()}
+                except Exception:
+                    vec = {}
+                # guarda vector anunciado por el vecino m.src
+                self.dv_peer_vectors[m.src] = vec
+                # tras recibir, intenta recomputar
+                self._dvr_recompute()
+                continue
+
+            # --- DATA genérico (LSR/DVR) ---
+            # --- MENSAJE UNICAST (LSR/DVR) ---
+            if m.type == "message":
+                # Si además tiene id/came_from ya fue manejado arriba como flooding
+                if header_get(m.headers, "id") is not None:
+                    # flooding ya se procesó
+                    continue
+
+                if m.dst == self.name:
+                    self._deliver(m)
+                else:
+                    self.send(m)  # usará routing_table (LSR/DVR) o broadcast si no hay ruta
+                continue
+
 
             # --- INFO u otros ---
             if m.type == "info" and m.dst == self.name:
                 print(f"[{self.name}] INFO: {m.payload}")
                 continue
 
-    # ---------------- routing (Dijkstra + LSP emit) ----------------
-    def _routing_loop(self) -> None:
-        """
-        1) Recalcula tabla de ruteo periódicamente.
-        2) Emite LSP con enlaces actuales cada ~3s.
-        """
-        next_lsp_at = 0.0
-        while not self.stop_event.is_set():
-            now = time.time()
 
-            if self.name not in self.graph:
-                self.graph[self.name] = {}
-            for v in list(self.neighbors):
-                self.graph.setdefault(self.name, {}).setdefault(v, 1.0)
-
-            self._recompute_routes()
-
-            if now >= next_lsp_at:
-                self._emit_lsp()
-                next_lsp_at = now + 3.0
-
-            time.sleep(1.0)
 
     def _recompute_routes(self) -> None:
         # Asegurar nodos/entradas
@@ -639,32 +819,41 @@ class Node:
         }
         for v in list(self.neighbors):
             m = Message(
-                proto="lsr",
-                type="lsp",
-                src=self.name,
-                dst=v,
-                ttl=8,
-                headers={"came_from": self.name},
-                payload=lsp,
-            )
+            type="lsp",
+            src=self.name,
+            dst=v,
+            headers=[{"came_from": self.name}, {"ttl": 8}],
+            payload=lsp
+        )
+
             self.send_raw(v, m.to_json())
 
     # ---------------- HELLO loop ----------------
     def _hello_loop(self) -> None:
+        TIMEOUT = 6.0  # 6–8s recomendado
         while not self.stop_event.is_set():
             t0 = time.time()
+            # 1) enviar HELLO a vecinos conocidos
             for v in list(self.neighbors):
                 hello = Message(
-                    proto="sys",
                     type="hello",
                     src=self.name,
                     dst=v,
-                    ttl=4,
-                    headers={"t0": t0},
-                    payload={},
+                    hops=0,
+                    headers=[{"t0": t0}, {"ttl": 4}],
+                    payload=""
                 )
                 self.send(hello)
+
+            # 2) revisar timeouts
+            now = time.time()
+            for v in list(self.neighbors):
+                last = self.last_seen.get(v, 0.0)
+                if now - last > TIMEOUT:
+                    self._link_bring_down(v)
+
             time.sleep(2.0)
+
 
     # ---------------- utils de entrega/usuario ----------------
     def _deliver(self, m: Message) -> None:
@@ -674,19 +863,20 @@ class Node:
         except Exception:
             payload_str = str(m.payload)
         cprint(
-        f"[bold green][{self.name}][/bold green] DATA entregado "
-        f"de [magenta]{m.src}[/magenta] → [cyan]{m.dst}[/cyan] "
-        f"(hops={getattr(m,'hops','?')}) | payload={payload_str}"
+            f"[bold green][{self.name}][/bold green] MESSAGE entregado "
+            f"de [magenta]{m.src}[/magenta] → [cyan]{m.dst}[/cyan] "
+            f"(hops={getattr(m,'hops','?')}) | payload={payload_str}"
         )
+
 
 
     def send(self, m: Message) -> None:
         """
-        Enrutador de alto nivel.
-        - Para LSR/DATA: decide next hop por routing_table; si no hay, broadcast.
-        - Para otros, si 'dst' es vecino lógico, envía directo; si no, broadcast.
+        Enrutador de alto nivel:
+        - Para unicast (LSR/DVR): usa routing_table; si no hay, broadcast.
+        - Para otros, si 'dst' es vecino, directo; si no, broadcast.
         """
-        if m.proto == "lsr" and m.type == "data":
+        if m.type == "message" and self.routing_protocol in {"lsr", "dvr"}:
             nh = self._next_hop_for(m.dst)
             if nh is None:
                 for v in self.neighbors:
@@ -701,55 +891,170 @@ class Node:
             for v in self.neighbors:
                 self.send_raw(v, m.to_json())
 
+
     def send_hello(self, dst: str, ttl: int = 8) -> None:
+        # ttl ya no va en el mensaje (tu clase Message no lo acepta)
         m = Message(
-            proto="sys",
             type="hello",
             src=self.name,
             dst=dst,
-            ttl=ttl,
-            headers={"t0": time.time()},
-            payload={},
             hops=0,
+            headers=hdr_make(t0=time.time()),  # lista de headers
+            payload="",                        # puede ser "" o {}
         )
         self.send(m)
 
-    def send_data(self, dst: str, text: str, ttl: int = 12) -> None:
-        if self.routing_protocol == "flooding":
-            self.send_data_flood(dst, text, ttl=ttl)
-            return
-        m = Message(
-            proto=self.routing_protocol,  # "lsr" o "dvr"
-            type="data",
-            src=self.name,
-            dst=dst,
-            ttl=ttl,
-            headers={},
-            payload={"text": text},
-            hops=0,                       # ← arranca en 0
-        )
-        self.send(m)
 
     def send_data_flood(self, dst: str, text: str, ttl: int = 12) -> None:
         msg_id = f"{self.name}-{int(time.time() * 1000)}-{random.randint(0, 9999)}"
         m = Message(
-            proto="flooding",
-            type="data",
+            type="message",
             src=self.name,
             dst=dst,
-            ttl=ttl,
-            headers={"id": msg_id, "came_from": self.name},
+            headers=[{"proto": "flooding"}, {"id": msg_id}, {"came_from": self.name}, {"ttl": ttl}],
             payload={"text": text},
+            hops=0
         )
         for v in list(self.neighbors):
-            # 👇 El log debe ir DENTRO del bucle, ya con v definido
+            cprint(f"[{self.name}] {ICON_SEND} enviando inicial a [green]{v}[/green]")
+            self.send_raw(v, m.to_json())
+
+
+
+    def send_data_flood(self, dst: str, text: str, ttl: int = 12) -> None:
+        msg_id = f"{self.name}-{int(time.time() * 1000)}-{random.randint(0, 9999)}"
+        m = Message(
+            type="message",
+            src=self.name,
+            dst=dst,
+            headers=[{"proto": "flooding"}, {"id": msg_id}, {"came_from": self.name}, {"ttl": ttl}],
+            payload={"text": text},
+            hops=0
+        )
+        for v in list(self.neighbors):
             try:
                 ch = (self.redis_channel_map or {}).get(v)
             except Exception:
                 ch = None
-            if 'cprint' in globals():
-                cprint(f"[{self.name}] {ICON_SEND} enviando inicial a [green]{v}[/green]{' ('+str(ch)+')' if ch else ''}")
+            cprint(f"[{self.name}] {ICON_SEND} enviando inicial a [green]{v}[/green]{' ('+str(ch)+')' if ch else ''}")
             self.send_raw(v, m.to_json())
+
+
+    def _routing_loop(self) -> None:
+        """
+        LSR:
+          - Recalcula tabla (Dijkstra) periódicamente
+          - Emite LSP cada ~3s
+        DVR:
+          - Emite anuncios DV cada ~3s (poison reverse)
+          - Recalcula con Bellman-Ford usando vectores recibidos
+        """
+        next_emit_at = 0.0
+        while not self.stop_event.is_set():
+            now = time.time()
+
+            # Mantener costos base a vecinos en el grafo
+            if self.name not in self.graph:
+                self.graph[self.name] = {}
+            for v in list(self.neighbors):
+                self.graph.setdefault(self.name, {}).setdefault(v, 1.0)
+
+            if self.routing_protocol == "lsr":
+                self._recompute_routes()           # Dijkstra
+                if now >= next_emit_at:
+                    self._emit_lsp()
+                    next_emit_at = now + 3.0
+
+            elif self.routing_protocol == "dvr":
+                if now >= next_emit_at:
+                    self._emit_dv()
+                    next_emit_at = now + getattr(self, "dv_period", 3.0)
+                self._dvr_recompute()
+
+            time.sleep(1.0)
+
+
+    def _emit_dv(self) -> None:
+        """
+        Envía anuncio DVR a cada vecino.
+        Usa poison reverse: si el next-hop a 'd' es 'v', anuncias INF a 'v' para 'd'.
+        """
+        base_cost = 1.0
+        for v in list(self.neighbors):
+            advertised: Dict[str, float] = {}
+            for d, dist in self.dv_dist.items():
+                if d == self.name:
+                    advertised[d] = 0.0
+                    continue
+                # poison reverse
+                if self.dv_next.get(d) == v:
+                    advertised[d] = self.DV_INF
+                else:
+                    advertised[d] = float(dist)
+
+            m = Message(
+                type="dv_announcement",
+                src=self.name,
+                dst=v,
+                hops=0,
+                headers=hdr_make(t=time.time()),
+                payload={"vector": advertised},
+            )
+
+
+            self.send_raw(v, m.to_json())
+
+    def _dvr_recompute(self) -> None:
+        """
+        Bellman-Ford: dist(d) = min_v { cost(self->v) + dist_v(d) }.
+        Actualiza dv_dist, dv_next y routing_table.
+        """
+        # costos directos a vecinos (base 1.0)
+        cost_to = {v: float(self.graph.get(self.name, {}).get(v, 1.0)) for v in self.neighbors}
+
+        # dist inicial: a mí mismo 0; a vecinos costo directo; otros INF
+        new_dist: Dict[str, float] = {self.name: 0.0}
+        new_next: Dict[str, Optional[str]] = {}
+
+        # Incluye destinos vistos en peers
+        all_dests: Set[str] = set([self.name])
+        for vec in self.dv_peer_vectors.values():
+            all_dests.update(vec.keys())
+
+        # Asegura que todos los vecinos existan como posibles destinos
+        all_dests.update(self.neighbors)
+
+        for d in all_dests:
+            if d == self.name:
+                continue
+            best = (self.DV_INF, None)  # (dist, next_hop)
+
+            # intento vía cada vecino v
+            for v in self.neighbors:
+                c_self_v = cost_to.get(v, 1.0)
+                vec_v = self.dv_peer_vectors.get(v, {})
+                d_v = float(vec_v.get(d, self.DV_INF))
+                cand = c_self_v + d_v
+                if cand < best[0]:
+                    best = (cand, v)
+
+            new_dist[d] = best[0]
+            new_next[d] = best[1]
+
+        # guarda y expone como routing_table
+        self.dv_dist = new_dist
+        self.dv_next = new_next
+
+        # construir routing_table a partir de dv_next (omitir destinos INF)
+        rt: Dict[str, str] = {}
+        for d, nh in new_next.items():
+            if d == self.name or nh is None:
+                continue
+            if new_dist.get(d, self.DV_INF) >= self.DV_INF:
+                continue
+            rt[d] = nh
+        self.routing_table = rt
+
 
 
     # ---------------- helpers opcionales ----------------
@@ -761,12 +1066,19 @@ class Node:
     def print_nodes(self):
         rows = []
         for k, cfg in self.names.items():
-            icon = ICON_NODE if k == self.name else ICON_NEUTRAL
+            if k == self.name:
+                icon = "🟢"
+                estado = "(YO)"
+            else:
+                up = self.neighbor_up.get(k, False)
+                icon = "🟢" if up else "⚪"
+                estado = "Activo" if up else "Inactivo"
             canal = cfg.get("channel", cfg.get("chan", ""))
             left = f"{icon} {('[bold](YO)[/bold] ' if k==self.name else '')}{k}"
             right = f"→ {canal}"
             rows.append((left, right))
         table_nodes("NODOS DISPONIBLES", rows)
+
 
 
     def _next_hop_for(self, dest: str) -> Optional[str]:
