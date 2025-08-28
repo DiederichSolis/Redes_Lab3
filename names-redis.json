@@ -1,9 +1,7 @@
 {
   "type": "names",
   "config": {
-    "A": { "host": "127.0.0.1", "port": 5001, "channel": "sec10.grupo7.sol22952" },
-    "B": { "host": "127.0.0.1", "port": 5002, "channel": "sec10.grupo7.jorgelopez" },
-    "C": { "host": "127.0.0.1", "port": 5003, "channel": "sec10.grupo7.boli" },
-    "D": { "host": "127.0.0.1", "port": 5004, "channel": "sec10.grupo7.angel" }
+    "A": { "host": "127.0.0.1", "port": 5001, "channel": "sec10.grupo7.diederich" },
+    "B": { "host": "127.0.0.1", "port": 5002, "channel": "sec10.grupo7.Jorge" }
   }
 }

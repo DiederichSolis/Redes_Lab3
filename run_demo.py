@@ -202,12 +202,27 @@ def handle_cli_command(nodes: Dict[str, Node], src: str, cmd: str) -> None:
     op = parts[0].lower()
 
     if op == "nodes":
-        print("NODOS DISPONIBLES:")
+        from rich.console import Console
+        from rich.table import Table
+
+        console = Console()
+        table = Table(title="🌐 NODOS DISPONIBLES", header_style="bold magenta")
+
+        table.add_column("Nodo", style="cyan", justify="center")
+        table.add_column("Estado", style="green", justify="center")
+        table.add_column("Canal", style="yellow")
+
         for k, cfg in nodes[src].names.items():
-            ch = cfg.get("channel", "")
-            yo = "(YO) " if k == src else ""
-            print(f"  {yo}{k} -> {ch}")
+            canal = cfg.get("channel", "")
+            if k == src:
+                estado = "🟢 (YO)"
+            else:
+                estado = "⚪ Activo"
+            table.add_row(k, estado, canal)
+
+        console.print(table)
         return
+
 
     if op == "broadcast" and len(parts) >= 2:
         text = parts[1] if len(parts) == 2 else parts[1] + " " + parts[2]
