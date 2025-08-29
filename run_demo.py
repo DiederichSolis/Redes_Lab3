@@ -262,8 +262,13 @@ def build_nodes(names, topo, algo, transport="udp", redis_cfg=None):
 
     # Construcción de nodos
     for name, cfg in names.items():
-        host = cfg["host"]
-        port = int(cfg["port"])
+        if transport == "udp":
+            host = cfg["host"]
+            port = cfg["port"]
+        else:  # transport == "redis"
+            host = "127.0.0.1"   # dummy, no se usa
+            port = 0             # dummy
+
         neighbors = topo.get(name, [])
 
         # Protocolo por nodo (override opcional en names.json)
@@ -517,7 +522,7 @@ def main():
 
     # --- bloque Redis cfg (solo si transport=redis) ---
     redis_cfg = None
-    
+
     if args.algo == "dvr":
         try:
             from router.node import print_dv_table

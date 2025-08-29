@@ -1,15 +1,7 @@
 {
   "type": "names",
   "config": {
-    "A": {
-      "host": "127.0.0.1",
-      "port": 10000,
-      "channel": "sec10.grupo7.diederich"
-    },
-    "B": {
-      "host": "127.0.0.1",
-      "port": 10001,
-      "channel": "sec10.grupo7.jorge"
-    }
+    "A": { "channel": "sec10.grupo7.diederich" },
+    "B": { "channel": "sec10.grupo7.jorge" }
   }
 }
