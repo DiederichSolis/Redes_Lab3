@@ -1,7 +1,11 @@
 {
-  "type": "names",
-  "config": {
-    "A": { "channel": "sec10.grupo7.diederich" },
-    "B": { "channel": "sec10.grupo7.jorge" }
+  "A": {
+    "channel": "sec10.group7.Joge"
+  },
+  "B": {
+    "channel": "sec10.group7.diederich"
+  },
+  "C": {
+    "channel": "sec10.group7.angel"
   }
 }

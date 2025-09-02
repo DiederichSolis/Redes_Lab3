@@ -1,123 +1,122 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Dict, Any
 
-# ---------- Bootstrap de imports (funciona con tu estructura) ----------
+# ========= Bootstrap imports (soporta tu estructura de carpetas) =========
 import sys
+import json
+import time
+import signal
+import argparse
 from pathlib import Path
+from typing import Dict, Any
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from router.node import Node  # node.py está en router/
+# router/
+from router.node import Node
 from router.metrics import collector
 
-# ---------- Imports estándar ----------
-import argparse
-import json
-import signal
-import time
-import threading
-from typing import Dict, List
-
-
-try:
-    from rich.console import Console
-    console = Console()
-    def dprint(msg): console.print(msg)
-except Exception:
-    def dprint(msg): print(msg)
-# --- Emojis para logs vistosos ---
-ICON_OK = "🟢"
-ICON_NODE = "🟢"
-ICON_NEUTRAL = "⚪"
-ICON_SEND = "🚀"
-ICON_BROADCAST = "📡"
-ICON_WARN = "⚠️"
-ICON_ERR = "❌"
-
-
-
-# --- pretty console helpers ---
+# ========= Pretty console opcional =========
 try:
     from rich.console import Console
     from rich.table import Table
-    _console = Console()
+    console = Console()
 except Exception:
-    _console = None
+    console = None
     Table = None
 
-def _print(msg: str):
-    if _console:
-        _console.print(msg)
+def _print(msg: str) -> None:
+    if console:
+        console.print(msg)
     else:
         print(msg)
 
-def cli_show_routes(nodes, src: str):
-    """Muestra la tabla de ruteo del nodo `src` (LSR/Dijkstra)."""
+# ========= Carga de archivos =========
+def _unwrap_config(obj: dict) -> dict:
+    """
+    Acepta tanto { "A": {...} } como { "type": "...", "config": {...} }
+    """
+    if isinstance(obj, dict) and isinstance(obj.get("config"), dict):
+        return obj["config"]
+    return obj
+
+def load_names(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"No existe names JSON: {p}")
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return _unwrap_config(data)
+
+def load_topo(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"No existe topo JSON: {p}")
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return _unwrap_config(data)
+
+# ========= Helpers de UI =========
+def cli_show_routes(nodes: Dict[str, Node], src: str) -> None:
     n = nodes[src]
     rt = getattr(n, "routing_table", {}) or {}
     proto = getattr(n, "routing_protocol", "unknown").upper()
 
-    if _console and Table:
-        table = Table(title=f"🗺️  Tabla de Enrutamiento de {src}  ({proto})",
-                      header_style="bold cyan")
-        table.add_column("Destino", justify="center", style="magenta")
-        table.add_column("Next-Hop", justify="center", style="green")
-        table.add_column("Costo (enlace directo)", justify="center", style="yellow")
-
+    if console and Table:
+        t = Table(title=f"🗺️  Tabla de Enrutamiento de {src}  ({proto})",
+                  header_style="bold cyan")
+        t.add_column("Destino", justify="center", style="magenta")
+        t.add_column("Next-Hop", justify="center", style="green")
+        t.add_column("Costo", justify="center", style="yellow")
         for dest, nh in sorted(rt.items()):
-            # Para costo mostramos el costo del primer enlace (src->nh) si existe
             cost = "—"
             try:
-                cost_val = n.graph.get(src, {}).get(nh)
-                if cost_val is not None:
-                    cost = f"{float(cost_val):.1f}"
+                c = n.graph.get(src, {}).get(nh)
+                if c is not None:
+                    cost = f"{float(c):.1f}"
             except Exception:
                 pass
-            table.add_row(dest, nh, str(cost))
-
+            t.add_row(dest, nh, str(cost))
         if not rt:
-            table.add_row("—", "—", "—")
-
-        _console.print(table)
+            t.add_row("—", "—", "—")
+        console.print(t)
     else:
         print(f"Tabla de Enrutamiento de {src} ({proto})")
         if not rt:
             print("  (vacía)")
         for dest, nh in sorted(rt.items()):
-            cost_val = n.graph.get(src, {}).get(nh, "—")
-            print(f"  {dest:>3}  ->  {nh:>3}   costo={cost_val}")
+            cost = n.graph.get(src, {}).get(nh, "—")
+            print(f"  {dest:>3} -> {nh:>3}  costo={cost}")
 
-def cli_show_lsdb(nodes, src: str):
-    """Muestra la 'LSDB' vista por `src`: n.graph = {u:{v:costo}}."""
+def cli_show_lsdb(nodes: Dict[str, Node], src: str) -> None:
     n = nodes[src]
     lsdb = getattr(n, "graph", {}) or {}
 
-    if _console and Table:
-        table = Table(title=f"📚  LSDB vista por {src}", header_style="bold magenta")
-        table.add_column("Nodo", style="cyan", justify="center")
-        table.add_column("Vecino", style="green", justify="center")
-        table.add_column("Costo", style="yellow", justify="center")
+    if console and Table:
+        t = Table(title=f"📚  LSDB de {src}", header_style="bold magenta")
+        t.add_column("Nodo", style="cyan", justify="center")
+        t.add_column("Vecino", style="green", justify="center")
+        t.add_column("Costo", style="yellow", justify="center")
 
         if not lsdb:
-            table.add_row("—", "—", "—")
+            t.add_row("—", "—", "—")
         else:
             for u, nbrs in sorted(lsdb.items()):
                 if not nbrs:
-                    table.add_row(u, "—", "—")
+                    t.add_row(u, "—", "—")
                 else:
                     for v, w in sorted(nbrs.items()):
                         try:
                             w = float(w)
                         except Exception:
                             pass
-                        table.add_row(u, v, f"{w}")
-        _console.print(table)
+                        t.add_row(u, v, f"{w}")
+        console.print(t)
     else:
-        print(f"LSDB vista por {src}")
+        print(f"LSDB de {src}")
         if not lsdb:
             print("  (vacía)")
         else:
@@ -128,155 +127,48 @@ def cli_show_lsdb(nodes, src: str):
                     for v, w in sorted(nbrs.items()):
                         print(f"  {u} -> {v}   costo={w}")
 
+# ========= Construcción de nodos =========
+def build_nodes(
+    names: dict,
+    topo: dict,
+    algo: str,
+    transport: str = "udp",
+    redis_cfg: dict | None = None,
+) -> Dict[str, Node]:
 
-# ---------- Utilidades para cargar archivos ----------
-def load_json(path: str) -> dict:
-    p = Path(path)
-    if not p.exists():
-        print(f"ERROR: no existe el archivo: {p}")
-        sys.exit(2)
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _unwrap_config(obj: dict) -> dict:
-    """
-    Acepta tanto:
-      { "A": {...}, "B": {...} }
-    como:
-      { "type": "names" | "topo", "config": { ... } }
-    """
-    if isinstance(obj, dict) and "config" in obj and isinstance(obj["config"], dict):
-        return obj["config"]
-    return obj
-
-
-import json
-
-
-def cli_show_routes(nodes, src):
-    from rich.console import Console
-    from rich.table import Table
-
-    n = nodes[src]
-    rt = getattr(n, "routing_table", {}) or {}
-    proto = getattr(n, "routing_protocol", "unknown").upper()
-
-    console = Console()
-    table = Table(title=f"🗺️  Tabla de Enrutamiento de {src}  ({proto})",
-                  header_style="bold cyan")
-    table.add_column("Destino", justify="center", style="magenta")
-    table.add_column("Next-Hop", justify="center", style="green")
-    table.add_column("Costo", justify="center", style="yellow")
-
-    # costo = 1 si hay enlace directo en n.graph; si no, deja “—”
-    for dest, nh in sorted(rt.items()):
-        cost = "—"
-        try:
-            cost_val = n.graph.get(src, {}).get(nh)
-            if cost_val is not None:
-                cost = f"{cost_val:.1f}"
-        except Exception:
-            pass
-        table.add_row(dest, nh, str(cost))
-
-    if not rt:
-        table.add_row("—", "—", "—")
-
-    console.print(table)
-
-def cli_show_lsdb(nodes, src):
-    from rich.console import Console
-    from rich.table import Table
-
-    n = nodes[src]
-    # Usamos n.graph como “LSDB” simple: {node: {vecino: costo}}
-    lsdb = getattr(n, "graph", {}) or {}
-
-    console = Console()
-    table = Table(title=f"📚  LSDB de {src}", header_style="bold magenta")
-    table.add_column("Nodo", style="cyan", justify="center")
-    table.add_column("Vecino", style="green", justify="center")
-    table.add_column("Costo", style="yellow", justify="center")
-
-    if not lsdb:
-        table.add_row("—", "—", "—")
-    else:
-        for u, nbrs in sorted(lsdb.items()):
-            if not nbrs:
-                table.add_row(u, "—", "—")
-            else:
-                for v, w in sorted(nbrs.items()):
-                    table.add_row(u, v, f"{float(w):.1f}")
-
-    console.print(table)
-
-
-def load_names(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    # Acepta los dos formatos:
-    # 1) plano: {"A": {...}, "B": {...}}
-    # 2) envuelto: {"type": "names", "config": {...}}
-    if isinstance(data, dict) and "config" in data and isinstance(data["config"], dict):
-        return data["config"]
-    return data
-
-def load_topo(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    # Acepta:
-    # 1) plano: {"A": ["B"], "B": ["A"]}
-    # 2) envuelto: {"type": "topo", "config": {...}}
-    if isinstance(data, dict) and "config" in data and isinstance(data["config"], dict):
-        return data["config"]
-    return data
-
-
-
-# ---------- Construcción / control de nodos ----------
-def build_nodes(names, topo, algo, transport="udp", redis_cfg=None):
-    nodes = {}
-
-    # Protocolos permitidos
     allowed = {"lsr", "dvr", "flooding"}
-    default_protocol = str(algo).lower()
-    if default_protocol not in allowed:
-        default_protocol = "lsr"
+    proto_default = (algo or "lsr").lower()
+    if proto_default not in allowed:
+        proto_default = "lsr"
 
-    # Asegurar que todos los nodos de 'names' existan en 'topo'
+    # Garantiza que todos existan en el topo
     for n in names.keys():
         topo.setdefault(n, [])
 
-    # Mapa lógico -> canal Redis
+    # Map de canales si usas Redis
+    channel_map = {}
     if transport == "redis":
-        channel_map = {}
         for k, v in names.items():
             ch = v.get("channel")
             if not ch:
-                raise ValueError(f"[Redis] Falta 'channel' para el nodo '{k}' en names-redis.json")
+                raise ValueError(f"[Redis] Falta 'channel' para '{k}' en names-redis.json")
             channel_map[k] = str(ch)
-    else:
-        # En UDP no usamos canales; dejamos identidad 1:1
-        channel_map = {k: k for k in names.keys()}
 
-    # Construcción de nodos
+    nodes: Dict[str, Node] = {}
+
     for name, cfg in names.items():
         if transport == "udp":
             host = cfg["host"]
-            port = cfg["port"]
-        else:  # transport == "redis"
-            host = "127.0.0.1"   # dummy, no se usa
-            port = 0             # dummy
+            port = int(cfg["port"])
+        else:
+            host = "127.0.0.1"   # no se usa en Redis
+            port = 0
 
-        neighbors = topo.get(name, [])
+        neighbors = list(topo.get(name, []))
+        node_proto = str(cfg.get("protocol", proto_default)).lower()
+        if node_proto not in allowed:
+            node_proto = proto_default
 
-        # Protocolo por nodo (override opcional en names.json)
-        node_protocol = str(cfg.get("protocol", default_protocol)).lower()
-        if node_protocol not in allowed:
-            node_protocol = default_protocol
-
-        # redis_cfg específico del nodo
         node_redis_cfg = None
         if transport == "redis":
             base = dict(redis_cfg or {})
@@ -295,94 +187,118 @@ def build_nodes(names, topo, algo, transport="udp", redis_cfg=None):
             neighbors=neighbors,
             transport=transport,
             redis_cfg=node_redis_cfg,
-            routing_protocol=node_protocol,
+            routing_protocol=node_proto,
         )
 
     return nodes
 
+# ========= Arranque/paro + métricas =========
+def start_nodes(nodes: Dict[str, Node]) -> None:
+    for n in nodes.values():
+        n.start()
+    _print(f"[demo] {list(nodes.keys())} nodos iniciados.")
 
+def stop_nodes(nodes: Dict[str, Node]) -> None:
+    for n in nodes.values():
+        n.stop()
+    _print("[demo] Nodos detenidos.")
 
+def handle_sigint(nodes: Dict[str, Node]):
+    def _handler(_sig, _frm):
+        print("\n[demo] SIGINT recibido. Deteniendo nodos…")
+        try:
+            collector.print_summary()
+            ts = int(time.time())
+            report = collector.get_comparison_report()
+            outfile = f"demo_metrics_{ts}.json"
+            with open(outfile, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+            print(f"[demo] 💾 Métricas guardadas: {outfile}")
+        except Exception as e:
+            print(f"[demo] Sin métricas: {e}")
+        stop_nodes(nodes)
+        sys.exit(0)
+    return _handler
 
-# ---------- Envío de mensaje de prueba ----------
-def demo_send(
-    algo: str,
-    nodes: Dict[str, Node],
-    src: str,
-    dst: str,
-    text: str,
-    ttl: int,
-) -> None:
+# ========= Envíos demo =========
+def demo_send(algo: str, nodes: Dict[str, Node], src: str, dst: str, text: str, ttl: int) -> None:
     if src not in nodes or dst not in nodes:
-        print(f"ERROR: src/dst inválidos. src={src} dst={dst} nodos={list(nodes.keys())}")
-        return
-
-    node_src = nodes[src]
-    dprint(f"[bold white on black][demo][/bold white on black] {ICON_SEND} Enviando [bold]MESSAGE {algo.upper()}[/bold] "
-       f"[magenta]{src}[/magenta] → [cyan]{dst}[/cyan]: [yellow]'{text}'[/yellow] (ttl={ttl})")
-
-    if algo == "flooding":
-        node_src.send_data_flood(dst, text, ttl=ttl)
-    else:
-        # LSR por defecto
-        node_src.send_data(dst, text, ttl=ttl)
-
-
-def demo_broadcast(nodes: Dict[str, Node], src: str, text: str, ttl: int = 10) -> None:
-    """
-    Emula 'broadcast': desde 'src' envía por flooding un MESSAGE por cada vecino destino lógico.
-    En node.py el flooding reenvía mientras m.dst != self.name, así que la red completa lo verá.
-    """
-    if src not in nodes:
-        print(f"ERROR: src inválido: {src}")
+        print(f"ERROR: src/dst inválidos. src={src} dst={dst}")
         return
     n = nodes[src]
-    for v in list(n.neighbors):
-        dprint(f"[bold white on black][demo][/bold white on black] {ICON_BROADCAST} Broadcast inicial a [green]{v}[/green]")
-        n.send_data_flood(v, text, ttl=ttl)
+    if algo == "flooding":
+        n.send_data_flood(dst, text, max_hops=ttl)
+    else:
+        n.send_data(dst, text)
 
+def demo_broadcast(nodes: Dict[str, Node], src: str, text: str, ttl: int = 10) -> None:
+    n = nodes[src]
+    for v in list(n.neighbors):
+        _print(f"[demo] 📡 Broadcast inicial → {v}")
+        n.send_data_flood(v, text, max_hops=ttl)
+
+# ========= CLI interactivo =========
+# ========= CLI interactivo =========
 def handle_cli_command(nodes: Dict[str, Node], src: str, cmd: str) -> None:
-    """
-    Intérprete de comandos simples:
-      - nodes
-      - broadcast <texto>
-      - send <DST> <texto>
-      - ping <DST>
-    """
-    cmd = cmd.strip()
+    cmd = (cmd or "").strip()
     if not cmd:
         return
-
     parts = cmd.split(maxsplit=2)
     op = parts[0].lower()
 
     if op == "nodes":
-        from rich.console import Console
-        from rich.table import Table
-
-        console = Console()
-        table = Table(title="🌐 NODOS DISPONIBLES", header_style="bold magenta")
-
-        table.add_column("Nodo", style="cyan", justify="center")
-        table.add_column("Estado", style="green", justify="center")
-        table.add_column("Canal", style="yellow")
-
-        for k, cfg in nodes[src].names.items():
-            canal = cfg.get("channel", "")
-            if k == src:
-                estado = "🟢 (YO)"
-            else:
-                estado = "⚪ Activo"
-            table.add_row(k, estado, canal)
-
-        console.print(table)
+        n = nodes[src]
+        if console and Table:
+            t = Table(title="🌐 NODOS DISPONIBLES", header_style="bold magenta")
+            t.add_column("Nodo", style="cyan", justify="center")
+            t.add_column("Estado", style="green", justify="center")
+            t.add_column("Canal", style="yellow")
+            for k, cfg in n.names.items():
+                canal = cfg.get("channel", "")
+                estado = "🟢 (YO)" if k == src else ("🟢 Activo" if n.neighbor_up.get(k, False) else "⚪ Inactivo")
+                t.add_row(k, estado, canal)
+            console.print(t)
+        else:
+            for k, cfg in nodes[src].names.items():
+                canal = cfg.get("channel", "")
+                print(f"{k:>3} -> {canal}")
         return
 
+    # sendf <DST> <texto...>  (flood unicast)
+    if op in ("sendf", "flood") and len(parts) >= 3:
+        dst = parts[1]
+        text = parts[2]
+        nodes[src].send_data_flood(dst, text, ttl=12)
+        return
 
+    # broadcast <texto...> (flood a todos, una inyección por vecino)
     if op == "broadcast" and len(parts) >= 2:
         text = parts[1] if len(parts) == 2 else parts[1] + " " + parts[2]
-        demo_broadcast(nodes, src, text, ttl=10)
+        for v in list(nodes[src].neighbors):
+            nodes[src].send_data_flood(v, text, ttl=12)
         return
-    
+
+    # ping <dst>   (HELLO/ECHO)
+    if op == "ping" and len(parts) >= 2:
+        dst = parts[1]
+        nodes[src].send_hello(dst)
+        time.sleep(0.7)
+        rtt = nodes[src].neighbor_rtt_ms.get(dst)
+        if rtt is not None:
+            print(f"[{src}] RTT {src}↔{dst}: {rtt:.1f} ms")
+        return
+
+    # info [vecino]  (LSP real)
+    if op == "info":
+        n = nodes[src]
+        if len(parts) >= 2 and parts[1]:
+            n._emit_info_lsr(only_to=parts[1])
+        else:
+            n._emit_info_lsr()
+        print(f"[{src}] INFO (LSR) emitido.")
+        return
+
+    # show routes | show lsdb
     if op == "show" and len(parts) >= 2:
         what = parts[1].lower()
         if what == "routes":
@@ -393,316 +309,111 @@ def handle_cli_command(nodes: Dict[str, Node], src: str, cmd: str) -> None:
             return
 
     if op in ("q", "quit", "exit"):
-        return 
-
-    if op == "send" and len(parts) >= 3:
-        dst, text = parts[1], parts[2]
-        demo_send("flooding", nodes, src, dst, text, ttl=10)
-        return
-
-    if op == "ping" and len(parts) >= 2:
-        dst = parts[1]
-        nodes[src].send_hello(dst)
-        return
-    
-    if op == "show" and len(parts) >= 2:
-        what = parts[1].lower()
-        if what == "routes":
-            cli_show_routes(nodes, src)
-            return
-        if what == "lsdb":
-            cli_show_lsdb(nodes, src)
-            return
-    
-    if op == "show" and len(parts) >= 2:
-        what = parts[1].lower()
-        if what == "dv":
-            n = nodes[src]
-            try:
-                from router.node import print_dv_table  # o import al inicio
-            except Exception:
-                pass
-            print_dv_table(n)
-            return
-
-
-
-    # (opcional) 'show routes all'
-    if op == "show" and len(parts) >= 3 and parts[1].lower() == "routes" and parts[2].lower() == "all":
-        for k in sorted(nodes.keys()):
-            cli_show_routes(nodes, k)
         return
 
     print(f"Comando no reconocido: {cmd}")
 
-# ---------- Manejo de Ctrl+C ----------
-def handle_sigint(nodes: Dict[str, Node]):
-    def _handler(_sig, _frm):
-        print("\n[demo] SIGINT recibido. Deteniendo nodos…")
-        
-        # Mostrar métricas finales si están disponibles
-        try:
-            collector.print_summary()
-            
-            # Generar reporte
-            timestamp = int(time.time())
-            report = collector.get_comparison_report()
-            report_file = f"demo_metrics_{timestamp}.json"
-            
-            try:
-                with open(report_file, "w", encoding="utf-8") as f:
-                    json.dump(report, f, indent=2, ensure_ascii=False)
-                print(f"[demo] 💾 Métricas guardadas: {report_file}")
-            except Exception as e:
-                print(f"[demo] ❌ Error guardando métricas: {e}")
-        except Exception as e:
-            print(f"[demo] No se pudieron generar métricas: {e}")
-        
-        stop_nodes(nodes)
-        sys.exit(0)
-
-    return _handler
-
-def start_nodes(nodes: Dict[str, Node]) -> None:
-    for n in nodes.values():
-        n.start()
-    # antes: print(f"[demo] {n} nodos iniciados.")
-    dprint(f"[bold white on black][demo][/bold white on black] [green]{n}[/green] nodos iniciados.")
-        
-
-def stop_nodes(nodes: Dict[str, Node]) -> None:
-    for n in nodes.values():
-        n.stop()
-    dprint("[bold white on black][demo][/bold white on black] [green]Nodos detenidos.[/green]")
-
-def print_tables(nodes: Dict[str, Any]) -> None:
-    print("\n[demo] Tablas de ruteo actuales:")
-    for name in sorted(nodes.keys()):
-        n = nodes[name]
-        protocol = getattr(n, "routing_protocol", "unknown").upper()
-        rt = getattr(n, "routing_table", {})
-        print(f"  - {name} ({protocol}): {rt}")
-
-
-# ---------- Main ----------
+# ========= Main =========
 def main():
-    parser = argparse.ArgumentParser(description="Run demo Lab 3 - Routing Protocols Comparison")
-    parser.add_argument("--no-demo", action="store_true", help="No enviar demo automática después del warmup")
-    parser.add_argument("--shell", action="store_true",
-                    help="Entrar a modo interactivo (prompt) tras el warmup")
-    parser.add_argument("--after-cmd", default="",
-                        help="Comando CLI para ejecutar tras el warmup (p.ej. 'broadcast HOLA')")
+    ap = argparse.ArgumentParser(description="Demo Lab 3 — Routing")
+    ap.add_argument("--names", default="names-sample.json")
+    ap.add_argument("--topo",  default="topo-sample.json")
+    ap.add_argument("--algo", choices=["lsr", "dvr", "flooding"], default="lsr")
+    ap.add_argument("--transport", choices=["udp", "redis"], default="udp")
+    ap.add_argument("--src", default="A")
+    ap.add_argument("--dst", default="B")
+    ap.add_argument("--text", default="Hola desde demo")
+    ap.add_argument("--ttl", type=int, default=10)
+    ap.add_argument("--warmup", type=float, default=3.0)
+    ap.add_argument("--shell", action="store_true")
+    ap.add_argument("--after-cmd", default="")
+    ap.add_argument("--ping", action="store_true")
 
-    parser.add_argument("--names", default="names-sample.json", help="Ruta a archivo JSON de nombres (host/port)")
-    parser.add_argument("--topo", default="topo-sample.json", help="Ruta a archivo JSON de topología")
-    parser.add_argument("--algo", choices=["lsr", "dvr", "flooding"], default="lsr", help="Algoritmo para DATA")
-    parser.add_argument("--src", default="A", help="Nodo origen lógico (clave en names)")
-    parser.add_argument("--dst", default="D", help="Nodo destino lógico (clave en names)")
-    parser.add_argument("--text", default="Hola desde demo", help="Texto a enviar")
-    parser.add_argument("--ttl", type=int, default=10, help="TTL del mensaje DATA")
-    parser.add_argument("--warmup", type=float, default=3.0, help="Segundos de espera antes de enviar DATA")
-    parser.add_argument("--after", type=float, default=3.0, help="Segundos de espera tras enviar DATA")
-    parser.add_argument("--compare", action="store_true", help="Ejecutar comparación LSR vs DVR")
-    parser.add_argument("--redis-username", default="default")
-    parser.add_argument("--ping", action="store_true",
-                    help="Enviar HELLO/echo del --src a --dst y mostrar RTT")
+    # Redis
+    ap.add_argument("--redis-host", default="lab3.redesuvg.cloud")
+    ap.add_argument("--redis-port", type=int, default=6379)
+    ap.add_argument("--redis-username", default="default")
+    ap.add_argument("--redis-password", default="UVGRedis2025")
 
-
-    # --- flags de transporte (Parte 2) ---
-    parser.add_argument("--transport", choices=["udp", "redis"], default="udp",
-                        help="Medio de transporte: udp o redis (Parte 2)")
-    parser.add_argument("--redis-host", default="lab3.redesuvg.cloud")
-    parser.add_argument("--redis-port", type=int, default=6379)
-    parser.add_argument("--redis-password", default="UVGRedis2025")
-
-    args = parser.parse_args()
+    args = ap.parse_args()
 
     names = load_names(args.names)
-    topo = load_topo(args.topo)
+    topo  = load_topo(args.topo)
 
-    # --- bloque Redis cfg (solo si transport=redis) ---
     redis_cfg = None
-
-    if args.algo == "dvr":
-        try:
-            from router.node import print_dv_table
-            print_dv_table(nodes[args.src])
-        except Exception:
-            pass
-
     if args.transport == "redis":
         redis_cfg = {
             "host": args.redis_host,
             "port": args.redis_port,
-            "password": args.redis_password,
             "username": args.redis_username,
+            "password": args.redis_password,
             "decode_responses": True,
         }
 
-    if args.compare:
-        # Modo comparación: crear nodos con diferentes protocolos
-        print("[demo] ===== COMPARACIÓN LSR vs DVR =====")
-        print("[demo] Transporte:", args.transport.upper())
-        print("[demo] Nodos A, B: LSR (Dijkstra)")
-        print("[demo] Nodos C, D: DVR (Bellman-Ford)")
+    nodes = build_nodes(
+        names=names,
+        topo=topo,
+        algo=args.algo,
+        transport=args.transport,
+        redis_cfg=redis_cfg,
+    )
 
-        nodes = {}
+    signal.signal(signal.SIGINT, handle_sigint(nodes))
 
-        # A y B con LSR
-        for name in ["A", "B"]:
-            cfg = names[name]
-            neighbors = topo.get(name, [])
-            n = Node(
-                name=name,
-                bind_host=cfg["host"],
-                bind_port=cfg["port"],
-                names=names,
-                neighbors=neighbors,
-                transport=args.transport,
-                redis_cfg=redis_cfg,
-                routing_protocol="lsr",
-            )
-            nodes[name] = n
-            n.start()
+    try:
+        start_nodes(nodes)
 
-        # C y D con DVR
-        for name in ["C", "D"]:
-            cfg = names[name]
-            neighbors = topo.get(name, [])
-            n = Node(
-                name=name,
-                bind_host=cfg["host"],
-                bind_port=cfg["port"],
-                names=names,
-                neighbors=neighbors,
-                transport=args.transport,
-                redis_cfg=redis_cfg,
-                routing_protocol="dvr",
-            )
-            nodes[name] = n
-            n.start()
+        if args.algo in ("lsr", "dvr"):
+            _print(f"[demo] Warmup {args.warmup:.1f}s para {args.algo.upper()} "
+                   "(mensajes de control + cómputo de rutas)…")
+        else:
+            _print("[demo] Warmup 3.0s (HELLO/vecinos)…")
 
-        # Manejo de Ctrl+C
-        signal.signal(signal.SIGINT, handle_sigint(nodes))
+        time.sleep(max(0.0, args.warmup))
 
-        try:
-            print("[demo] Esperando 5s a que se propaguen LSPs/DV y se estabilicen rutas...")
-            time.sleep(5)
+        # Mostrar estado de la fuente
+        if args.algo == "lsr":
+            _print("[demo] Mostrando LSDB y rutas (LSR)…")
+            cli_show_lsdb(nodes, args.src)
+            cli_show_routes(nodes, args.src)
 
-            print("\n[demo] ===== TABLAS DE ENRUTAMIENTO =====")
-            for k, n in nodes.items():
-                protocol = "LSR" if n.routing_protocol == "lsr" else "DVR"
-                print(f"{k} ({protocol}) → {n.routing_table}")
-
-            print("\n[demo] ===== ENVIANDO DATOS =====")
-            print("[demo] Enviando MESSAGE A→D usando LSR...")
-            nodes["A"].send_data("D", "Hola desde A usando LSR", ttl=10)
-
-            print("[demo] Enviando MESSAGE C→A usando DVR...")
-            nodes["C"].send_data("A", "Hola desde C usando DVR", ttl=10)
-
-            print("[demo] Enviando MESSAGE B→C usando Flooding...")
-            nodes["B"].send_data_flood("C", "Hola desde B usando Flooding", ttl=10)
-
-            print("\n[demo] ===== MONITOREO CONTINUO =====")
-            print("[demo] Presiona Ctrl+C para detener y ver métricas")
-            time.sleep(2)
-            print("[demo] Enviando mensajes adicionales...")
-            nodes["B"].send_data("A", "Mensaje adicional B→A")
-            nodes["D"].send_data("C", "Mensaje adicional D→C")
-            time.sleep(1)
-
-            cycle = 0
-            while True:
-                time.sleep(3)
-                cycle += 1
-                print(f"\n[demo] --- Ciclo {cycle} ---")
-                for k, n in nodes.items():
-                    protocol = "LSR" if n.routing_protocol == "lsr" else "DVR"
-                    routes_count = len([r for r in n.routing_table.values() if r])
-                    print(f"{k} ({protocol}): {routes_count} rutas activas")
-                if cycle % 3 == 0:
-                    nodes["A"].send_data("D", f"Ping ciclo {cycle}")
-                    print("[demo] Enviado ping periódico A→D")
-
-        except KeyboardInterrupt:
-            print("\n[demo] Interrupción recibida.")
-        finally:
-            stop_nodes(nodes)
-
-    else:
-        # Modo normal: todos los nodos con el mismo protocolo
-        nodes = build_nodes(
-            names,
-            topo,
-            args.algo,
-            transport=args.transport,   # <-- pasa transporte
-            redis_cfg=redis_cfg,        # <-- pasa redis_cfg (o None)
-        )
-
-        signal.signal(signal.SIGINT, handle_sigint(nodes))
-
-        try:
-            start_nodes(nodes)
-
-            if args.algo in ["lsr", "dvr"]:
-                print(f"[demo] Warmup {args.warmup:.1f}s para {args.algo.upper()} (emisión/recepción de mensajes de control + computación de rutas)…")
+        # Ping one-shot por bandera
+        if args.ping:
+            print(f"[demo] PING {args.src} → {args.dst} (HELLO/ECHO)…")
+            nodes[args.src].send_hello(args.dst)
+            time.sleep(1.0)
+            rtt = nodes[args.src].neighbor_rtt_ms.get(args.dst)
+            if rtt is not None:
+                print(f"[demo] RTT {args.src}↔{args.dst}: {rtt:.1f} ms")
             else:
-                dprint("[bold white on black][demo][/bold white on black] Warmup 3.0s [yellow](HELLO/vecinos)[/yellow]…")
-            time.sleep(max(0.0, args.warmup))
-            # en run_demo.py, después del warmup:
+                print(f"[demo] RTT {args.src}↔{args.dst}: (sin medición)")
 
-            if args.algo == "lsr":
-                _print("[bold white on black][demo][/bold white on black] Mostrando LSDB y rutas (LSR)…")
-                # Para el nodo fuente:
-                try:
-                    cli_show_lsdb(nodes, args.src)
-                    cli_show_routes(nodes, args.src)
-                except Exception:
-                    pass
+        # Tablas rápidas
+        print("\n[demo] Tablas de ruteo actuales:")
+        for k in sorted(nodes.keys()):
+            proto = getattr(nodes[k], "routing_protocol", "unknown").upper()
+            rt = getattr(nodes[k], "routing_table", {})
+            print(f"  - {k} ({proto}): {rt}")
 
+        # after-cmd o shell
+        if args.after_cmd:
+            handle_cli_command(nodes, args.src, args.after_cmd)
+        elif args.shell:
+            try:
+                while True:
+                    cmd = input(f"[{args.src}]> ").strip()
+                    if cmd.lower() in ("q", "quit", "exit"):
+                        break
+                    handle_cli_command(nodes, args.src, cmd)
+            finally:
+                stop_nodes(nodes)
+                return
+        else:
+            # Demo simple: enviar mensaje una vez
+            demo_send(args.algo, nodes, args.src, args.dst, args.text, args.ttl)
 
-            # <<< AQUI VA EL PING >>>
-            if args.ping:
-                print(f"[demo] PING {args.src} → {args.dst} (HELLO/echo)…")
-                nodes[args.src].send_hello(args.dst)
-                time.sleep(1.0)  # da tiempo a que regrese el echo
-                rtt = nodes[args.src].neighbor_rtt_ms.get(args.dst)
-                if rtt is not None:
-                    print(f"[demo] RTT {args.src}↔{args.dst}: {rtt:.2f} ms")
-                else:
-                    print(f"[demo] RTT {args.src}↔{args.dst}: (sin medición)")
-
-            if args.algo in ["lsr", "dvr"]:
-                print_tables(nodes)
-
-                        # --- flujo tras warmup ---
-            # a) si pasaron un comando, ejecútalo (ej. --after-cmd "broadcast HOLA")
-            if args.after_cmd:
-                handle_cli_command(nodes, args.src, args.after_cmd)
-
-            # b) si pidieron shell, entra a modo interactivo
-            elif args.shell:
-                try:
-                    while True:
-                        cmd = input(f"[{args.src}]> ").strip()
-                        if cmd.lower() in ("q", "quit", "exit"):
-                            break
-                        handle_cli_command(nodes, args.src, cmd)
-                finally:
-                    stop_nodes(nodes)
-                    return
-
-            # c) si no, ejecuta la demo automática (una sola vez) y termina
-            else:
-                demo_send(args.algo, nodes, args.src, args.dst, args.text, args.ttl)
-
-
-
-        finally:
-            stop_nodes(nodes)
-
-
+    finally:
+        stop_nodes(nodes)
 
 if __name__ == "__main__":
     main()

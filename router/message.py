@@ -1,64 +1,55 @@
 # router/message.py
 from __future__ import annotations
 import json
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, Optional
 
-HeadersType = List[Dict[str, Any]]
-PayloadType = Union[str, Dict[str, Any]]
-
-@dataclass
 class Message:
-    # EXACTAMENTE los campos del PDF
-    type: str                 # "message" | "echo" | "info" | "hello" | ...
-    src: str                  # "from"
-    dst: str                  # "to"
-    hops: int = 0
-    headers: HeadersType = field(default_factory=list)
-    payload: PayloadType = ""
+    def __init__(
+        self,
+        type: str,
+        src: str,
+        dst: str,
+        hops: int = 0,
+        headers: Optional[Dict[str, Any]] = None,
+        seq_num: Optional[int] = None,
+        neighbors: Optional[Dict[str, float]] = None,
+        payload: Any = None,
+    ):
+        self.type = type.lower().strip()       # hello | echo | info | message
+        self.src = src                         # canal o nombre
+        self.dst = dst                         # canal o nombre
+        self.hops = int(hops)
+        self.headers = headers or {}           # {"alg": "lsr|flooding|dvr", ...}
+        self.seq_num = seq_num                 # SOLO en info (LSR)
+        self.neighbors = neighbors             # SOLO en info (LSR) {nodo: costo}
+        self.payload = payload                 # SOLO en message
 
     def to_json(self) -> str:
-        body = {
+        d = {
             "type": self.type,
             "from": self.src,
             "to": self.dst,
-            "hops": int(self.hops),
-            "headers": self.headers if isinstance(self.headers, list) else [],
-            "payload": self.payload,
+            "hops": self.hops,
+            "headers": self.headers,
         }
-        return json.dumps(body, ensure_ascii=False)
+        if self.seq_num is not None:
+            d["seq_num"] = self.seq_num
+        if self.neighbors is not None:
+            d["neighbors"] = self.neighbors
+        if self.payload is not None:
+            d["payload"] = self.payload
+        return json.dumps(d, ensure_ascii=False)
 
     @staticmethod
-    def from_json(s: str) -> "Message":
-        o = json.loads(s)
-        src = o.get("from", o.get("src", ""))
-        dst = o.get("to",   o.get("dst", ""))
-
-        mtype = o.get("type", "message")
-
-        try:
-            hops = int(o.get("hops", 0))
-        except Exception:
-            hops = 0
-
-        headers_raw = o.get("headers", [])
-        if isinstance(headers_raw, dict):
-            headers: HeadersType = [headers_raw]
-        elif isinstance(headers_raw, list):
-            headers = [h for h in headers_raw if isinstance(h, dict)]
-        else:
-            headers = []
-
-        payload_raw = o.get("payload", "")
-        payload: PayloadType = payload_raw if isinstance(payload_raw, (str, dict)) else str(payload_raw)
-
-        return Message(type=mtype, src=src, dst=dst, hops=hops, headers=headers, payload=payload)
-
-# Constantes (opcional)
-class MessageType:
-    MESSAGE = "message"
-    HELLO = "hello"
-    ECHO = "echo"
-    INFO = "info"
-    LSP = "lsp"                # si lo usas internamente
-    DV_ANNOUNCEMENT = "dv_announcement"
+    def from_json(raw: str) -> "Message":
+        d = json.loads(raw)
+        return Message(
+            type=d.get("type",""),
+            src=d.get("from",""),
+            dst=d.get("to",""),
+            hops=int(d.get("hops",0)),
+            headers=d.get("headers") or {},
+            seq_num=d.get("seq_num"),
+            neighbors=d.get("neighbors"),
+            payload=d.get("payload"),
+        )
