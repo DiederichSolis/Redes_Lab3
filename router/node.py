@@ -8,6 +8,11 @@ from typing import Dict, List, Set, Optional, Tuple, Any
 from .message import Message
 from .dvr import DistanceVectorRouter # Asegúrate de que dvr.py esté en el PYTHONPATH
 
+# Mini paleta de colores para logs del nodo
+class CC:
+    RESET="\033[0m"; BOLD="\033[1m"
+    G="\033[92m"; R="\033[91m"; Y="\033[93m"; C="\033[96m"; M="\033[95m"; B="\033[94m"; GR="\033[90m"
+
 
 # --- Dijkstra: grafo ponderado no dirigido ---
 def dijkstra(graph: Dict[str, Dict[str, float]], src: str):
@@ -153,7 +158,7 @@ class Node:
         self.t_routing.start()
         self.t_watch.start()
 
-        print(f"[{self.name}] started | alg={self.algorithm} | channel={self.channel} | neighbors={self.neighbor_ids}")
+        print(f"{CC.G}[{self.name}] started{CC.RESET} | alg={self.algorithm} | channel={self.channel} | neighbors={self.neighbor_ids}")
 
     def stop(self):
         self.running = False
@@ -161,7 +166,8 @@ class Node:
             if t:
                 t.join(timeout=1.0)
         self._redis_close()
-        print(f"[{self.name}] stopped.")
+        print(f"{CC.GR}[{self.name}] stopped.{CC.RESET}")
+
 
     # ---------------- Transporte: Redis ----------------
     def _redis_connect(self):
@@ -330,7 +336,7 @@ class Node:
                         self.graph.get(v, {}).pop(self.name, None)
                         # DV: enlace directo eliminado
                         self.dvr.update_direct_link(v, None)
-                        print(f"[{self.name}] vecino DOWN: {v}")
+                        print(f"{CC.R}[{self.name}] vecino DOWN: {v}{CC.RESET}")
                     else:
                         # vecino vuelve
                         c = float(self.link_costs.get(v, 1.0))
@@ -338,7 +344,7 @@ class Node:
                         self.graph.setdefault(v, {})[self.name] = c
                         # DV: enlace directo restaurado
                         self.dvr.update_direct_link(v, c)
-                        print(f"[{self.name}] vecino UP: {v}")
+                        print(f"{CC.G}[{self.name}] vecino UP: {v}{CC.RESET}")
             if changed:
                 if self.algorithm == "lsr":
                     self._emit_info_lsr()  # anuncia cambio
@@ -492,5 +498,10 @@ class Node:
         # print(f"[{self.name}] routes: {self.route_table}")
 
     # ---------------- Entrega local ----------------
-    def _deliver(self, m: Message):
-        print(f"[{self.name}] DATA de {m.src} -> {m.dst}: {m.payload}")
+    def _deliver(self, m):
+        # Versión compatible: si no tienes la clase de colores CC, cae al print simple
+        try:
+            print(f"{CC.C}📬 [{self.name}] DATA de {m.src or '?'} -> {m.dst}: {m.payload}{CC.RESET}")
+        except NameError:
+            print(f"[{self.name}] DATA de {m.src} -> {m.dst}: {m.payload}")
+
