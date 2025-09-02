@@ -1,165 +1,165 @@
+# dvr.py
 from __future__ import annotations
-from typing import Dict, Tuple, List
-import copy
+from typing import Dict, Tuple, Optional
 
-def bellman_ford(graph: Dict[str, Dict[str, float]], source: str) -> Tuple[Dict[str, float], Dict[str, str]]:
-    """
-    Algoritmo de Bellman-Ford para Distance Vector Routing.
-    
-    Args:
-        graph: Grafo dirigido con pesos {u: {v: w, ...}, ...}
-        source: Nodo origen
-    
-    Returns:
-        (dist, prev) donde dist[v] = distancia mínima, prev[v] = predecesor
-    """
-    # Inicialización
-    dist = {v: float('inf') for v in graph}
-    prev = {v: None for v in graph}
-    dist[source] = 0.0
-    
-    # Relajación de aristas |V|-1 veces
-    for _ in range(len(graph) - 1):
-        for u in graph:
-            for v, weight in graph[u].items():
-                if dist[u] != float('inf') and dist[u] + weight < dist[v]:
-                    dist[v] = dist[u] + weight
-                    prev[v] = u
-    
-    # Detección de ciclos negativos (opcional para este lab)
-    for u in graph:
-        for v, weight in graph[u].items():
-            if dist[u] != float('inf') and dist[u] + weight < dist[v]:
-                print(f"⚠️  Ciclo negativo detectado en {u} -> {v}")
-                # En caso de ciclo negativo, marcamos como inalcanzable
-                dist[v] = float('inf')
-                prev[v] = None
-    
-    return dist, prev
+INF = 1e12  # "infinito" práctico para DV
 
-def next_hop_for_dvr(dest: str, source: str, prev: Dict[str, str]) -> str | None:
-    """
-    Encuentra el next hop para DVR recorriendo predecesores.
-    Similar a Dijkstra pero optimizado para DVR.
-    """
-    if dest == source:
-        return source
-    
-    if prev.get(dest) is None:
-        return None
-    
-    cur = dest
-    path = [cur]
-    
-    # Recorrer predecesores hasta encontrar el vecino inmediato
-    while prev.get(cur) is not None and prev[cur] != source:
-        cur = prev[cur]
-        path.append(cur)
-        if len(path) > 1000:  # Protección contra loops
-            break
-    
-    # El next hop es el último nodo antes de source
-    if path and prev.get(path[-1]) == source:
-        return path[-1]
-    
-    # Fallback: si no hay ruta clara, usar el predecesor directo
-    return prev.get(dest)
 
 class DistanceVectorRouter:
     """
-    Router que implementa Distance Vector Routing.
-    Mantiene tabla de distancias y actualiza periódicamente.
+    Implementación minimal de Distance Vector (Bellman-Ford distribuido).
+    - Mantiene:
+        * costos directos: c(x,v)
+        * anuncios de vecinos: D_v(*)
+        * tabla local: D_x(dest) = (dist, next_hop)
+    - Soporta split-horizon / poison-reverse opcionales.
+    - Sin temporizadores de hold-down (se pueden agregar luego).
     """
-    
-    def __init__(self, node_name: str):
-        self.node_name = node_name
-        # Tabla de distancias: {destino: (distancia, next_hop)}
-        self.distance_table: Dict[str, Tuple[float, str]] = {}
-        # Tabla de vecinos y sus anuncios
-        self.neighbor_announcements: Dict[str, Dict[str, float]] = {}
-        # Costos de enlaces directos
-        self.direct_costs: Dict[str, float] = {}
-        
-    def update_direct_link(self, neighbor: str, cost: float):
-        """Actualiza el costo de un enlace directo."""
-        self.direct_costs[neighbor] = cost
-        self._recompute_distances()
-    
-    def receive_announcement(self, from_neighbor: str, distances: Dict[str, float]):
-        """Recibe anuncio de distancia de un vecino."""
-        self.neighbor_announcements[from_neighbor] = distances.copy()
-        self._recompute_distances()
-    
-    def _recompute_distances(self):
-        """Recalcula todas las distancias usando Bellman-Ford."""
-        # Construir grafo completo para Bellman-Ford
-        graph = self._build_complete_graph()
-        
-        try:
-            dist, prev = bellman_ford(graph, self.node_name)
-            
-            # Actualizar tabla de distancias
-            new_distance_table = {}
-            for dest in dist:
-                if dest == self.node_name:
-                    continue
-                if dist[dest] != float('inf'):
-                    next_hop = next_hop_for_dvr(dest, self.node_name, prev)
-                    if next_hop:
-                        new_distance_table[dest] = (dist[dest], next_hop)
-            
-            self.distance_table = new_distance_table
-            
-        except Exception as e:
-            print(f"[{self.node_name}] Error en DVR: {e}")
-    
-    def _build_complete_graph(self) -> Dict[str, Dict[str, float]]:
-        """Construye grafo completo combinando enlaces directos y anuncios de vecinos."""
-        graph = {self.node_name: {}}
-        
-        # Agregar enlaces directos
-        for neighbor, cost in self.direct_costs.items():
-            graph[self.node_name][neighbor] = cost
-            if neighbor not in graph:
-                graph[neighbor] = {}
-            graph[neighbor][self.node_name] = cost  # Simetría
-        
-        # Agregar rutas anunciadas por vecinos
-        for neighbor, announcements in self.neighbor_announcements.items():
-            if neighbor not in graph:
-                graph[neighbor] = {}
-            
-            for dest, cost in announcements.items():
-                if dest != self.node_name:  # No crear loops
-                    graph[neighbor][dest] = cost
-                    if dest not in graph:
-                        graph[dest] = {}
-        
-        return graph
-    
-    def get_next_hop(self, destination: str) -> str | None:
-        """Obtiene el next hop para un destino."""
-        if destination in self.distance_table:
-            return self.distance_table[destination][1]
-        return None
-    
-    def get_distance(self, destination: str) -> float:
-        """Obtiene la distancia a un destino."""
-        if destination in self.distance_table:
-            return self.distance_table[destination][0]
-        return float('inf')
-    
+
+    def __init__(self, node_name: str,
+                 split_horizon: bool = True,
+                 poison_reverse: bool = False):
+        self.node = node_name
+        self.split_horizon = split_horizon
+        self.poison_reverse = poison_reverse
+
+        # D_x(dest) -> (dist, next_hop)
+        self.dv: Dict[str, Tuple[float, Optional[str]]] = {self.node: (0.0, None)}
+        # c(x,v)
+        self.direct_cost: Dict[str, float] = {}
+        # Anuncios recibidos de cada vecino: neighbor -> {dest: dist}
+        self.recv_from_neighbor: Dict[str, Dict[str, float]] = {}
+
+    # ---------- util ----------
+    def _ensure_self(self):
+        if self.node not in self.dv:
+            self.dv[self.node] = (0.0, None)
+
+    def _set_direct(self, neighbor: str, cost: float):
+        self.direct_cost[neighbor] = float(cost)
+
+    # ---------- API: enlaces directos ----------
+    def update_direct_link(self, neighbor: str, cost: Optional[float]):
+        """
+        Define/actualiza el costo c(x,neighbor). Si cost es None, elimina el enlace (∞).
+        Dispara recomputación.
+        """
+        if cost is None:
+            # enlace caído
+            if neighbor in self.direct_cost:
+                del self.direct_cost[neighbor]
+        else:
+            self._set_direct(neighbor, cost)
+        self.recompute()
+
+    # ---------- API: anuncios recibidos ----------
+    def receive_announcement(self, from_neighbor: str, vector: Dict[str, float]):
+        """
+        Guarda el vector D_from_neighbor(*) recibido (p. ej., por INFO/alg=dvr).
+        Distancias inválidas/ausentes se tratan como INF.
+        """
+        self.recv_from_neighbor[from_neighbor] = dict(vector or {})
+        self.recompute()
+
+    # ---------- Recomputación DV ----------
+    def recompute(self):
+        """
+        Aplica la ecuación DV con la info local actual:
+           D_x(y) = min_v [ c(x,v) + D_v(y) ]
+        """
+        self._ensure_self()
+
+        # Inicializa con infinito
+        new_dv: Dict[str, Tuple[float, Optional[str]]] = {self.node: (0.0, None)}
+
+        # Siempre considerar vecinos directos como candidatos a destinos
+        candidates = set(self.direct_cost.keys())
+
+        # y todos los destinos que aparecen en anuncios de vecinos
+        for n, vec in self.recv_from_neighbor.items():
+            candidates.update(vec.keys())
+
+        # para cada destino y, calcula el mejor next_hop v
+        for dest in candidates:
+            best_cost = INF
+            best_nh: Optional[str] = None
+
+            for v, c_xv in self.direct_cost.items():
+                # D_v(y) recibido; si no hay info, INF
+                dv_vy = self.recv_from_neighbor.get(v, {}).get(dest, INF)
+
+                # split-horizon / poison-reverse:
+                # si la mejor ruta actual a 'dest' usaba 'v', entonces cuando
+                # anunciemos a 'v' aplicaremos split/poison; aquí NO bloqueamos cálculo.
+                cost = c_xv + dv_vy
+                if cost < best_cost:
+                    best_cost, best_nh = cost, v
+
+            # Si 'dest' es vecino directo, compara con el enlace directo puro (camino 1 salto)
+            if dest in self.direct_cost and self.direct_cost[dest] < best_cost:
+                best_cost = self.direct_cost[dest]
+                best_nh = dest
+
+            # Si es yo mismo
+            if dest == self.node:
+                best_cost, best_nh = 0.0, None
+
+            # Guarda resultado (si no se aprendió nada, quedará INF y next_hop None)
+            new_dv[dest] = (best_cost, best_nh)
+
+        # Limpieza: si algo quedó en INF y no es vecino ni yo, puedes omitirlo
+        cleaned: Dict[str, Tuple[float, Optional[str]]] = {}
+        for d, (dist, nh) in new_dv.items():
+            if d == self.node or d in self.direct_cost or dist < INF:
+                cleaned[d] = (dist, nh)
+
+        self.dv = cleaned
+
+    # ---------- Lecturas ----------
+    def get_distance(self, dest: str) -> float:
+        return self.dv.get(dest, (INF, None))[0]
+
+    def get_next_hop(self, dest: str) -> Optional[str]:
+        return self.dv.get(dest, (INF, None))[1]
+
     def get_routing_table(self) -> Dict[str, str]:
-        """Retorna tabla de enrutamiento en formato {dest: next_hop}."""
-        return {dest: next_hop for dest, (_, next_hop) in self.distance_table.items()}
-    
-    def get_distance_table(self) -> Dict[str, Tuple[float, str]]:
-        """Retorna tabla completa de distancias."""
-        return self.distance_table.copy()
-    
-    def announce_distances(self) -> Dict[str, float]:
-        """Prepara anuncio de distancias para vecinos."""
-        announcement = {}
-        for dest, (dist, _) in self.distance_table.items():
-            announcement[dest] = dist
-        return announcement
+        table: Dict[str, str] = {}
+        for d, (dist, nh) in self.dv.items():
+            if d == self.node:
+                continue
+            if dist < INF and nh is not None:
+                table[d] = nh
+        return table
+
+    def get_distance_table(self) -> Dict[str, Tuple[float, Optional[str]]]:
+        return dict(self.dv)
+
+    # ---------- Anuncios hacia vecinos ----------
+    def announce_for(self, to_neighbor: str) -> Dict[str, float]:
+        """
+        Vector que debo anunciar a 'to_neighbor', aplicando split-horizon/poison-reverse.
+        - split-horizon: no anuncio rutas cuyo next_hop == to_neighbor
+        - poison-reverse: anuncio esas rutas con INF en lugar de ocultarlas
+        """
+        out: Dict[str, float] = {}
+        for d, (dist, nh) in self.dv.items():
+            if d == self.node:
+                out[d] = 0.0
+                continue
+            if nh == to_neighbor:
+                if self.poison_reverse:
+                    out[d] = INF
+                elif self.split_horizon:
+                    continue
+                else:
+                    out[d] = dist
+            else:
+                out[d] = dist
+        return out
+
+    def announce_broadcast(self) -> Dict[str, float]:
+        """
+        Vector genérico (sin split-horizon). Útil si tu transporte no permite
+        personalizar por vecino. Si puedes personalizar, usa announce_for().
+        """
+        return {d: dist for d, (dist, _nh) in self.dv.items()}
