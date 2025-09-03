@@ -6,7 +6,7 @@ import queue
 from typing import Dict, List, Set, Optional, Tuple, Any
 
 from .message import Message
-from .dvr import DistanceVectorRouter # Asegúrate de que dvr.py esté en el PYTHONPATH
+from .dvr import DistanceVectorRouter  # Asegúrate de que dvr.py esté en el PYTHONPATH
 
 # Mini paleta de colores para logs del nodo
 class CC:
@@ -54,7 +54,7 @@ class Node:
     Nodo de ruteo con:
       - Descubrimiento: HELLO/ECHO (ping/RTT)
       - LSR: INFO (LSP con seq_num + neighbors{n:cost}) + Dijkstra
-      - DVR: INFO (vector de distancias {dest:dist}), split-horizon/poison-reverse desde dvr.py
+      - DVR: INFO (vector de distancias {dest:dist})
       - Mensajes de usuario: MESSAGE (alg=lsr|flooding|dvr)
       - Broadcast: MESSAGE con dst="*"
       - Robustez: reconexión Redis, detección vecino up/down y anuncios por cambio
@@ -69,13 +69,19 @@ class Node:
                  algorithm: str = "lsr",
                  transport: str = "redis",
                  redis_cfg: Optional[Dict[str, Any]] = None):
-        # Identidad
+        # Identidad interna (A/B/C) y canal propio
         self.name = name
         self.channel = channel
 
-        # Vecinos lógicos (IDs); los canales se buscan en channel_by_node
+        # Vecinos lógicos (IDs internos A/B/C); los canales se buscan en channel_by_node
         self.neighbor_ids = list(neighbor_ids)
         self.channel_by_node = dict(channel_by_node)
+
+        # --- Modo interoperabilidad: usar canales en from/to "en el cable"
+        # Si True: al ENVIAR usamos canales; al RECIBIR convertimos de canal -> ID interno (A/B/C).
+        self.use_channel_ids_on_wire: bool = True
+        # Mapa inverso: canal -> ID interno
+        self.rev_channel: Dict[str, str] = {ch: nid for nid, ch in self.channel_by_node.items()}
 
         # Algoritmo por defecto (lsr|flooding|dvr)
         self.algorithm = (algorithm or "lsr").lower()
@@ -109,7 +115,7 @@ class Node:
 
         # Secuencias INFO
         self.lsr_seq = 0
-        self.dvr_seq = 0  # útil si quieres ver versiones de anuncios; DV no requiere seq estrictamente
+        self.dvr_seq = 0  # DV no requiere seq estrictamente
 
         # DVR engine
         self.dvr = DistanceVectorRouter(self.name, split_horizon=True, poison_reverse=False)
@@ -124,6 +130,27 @@ class Node:
         # Transporte (Redis)
         self.redis = None
         self.pubsub = None
+
+    # ---------------- Helpers de IDs en el cable ----------------
+    def _wire_id(self, nid: str) -> str:
+        """Devuelve el ID para poner 'en el cable': canal si está activo el modo; si no, el mismo nid."""
+        if not self.use_channel_ids_on_wire:
+            return nid
+        return self.channel_by_node.get(nid, nid)
+
+    def _internal_id(self, wire: str) -> str:
+        """Convierte del ID en el cable (canal) a ID interno A/B/C; si no existe, deja como viene."""
+        if not self.use_channel_ids_on_wire:
+            return wire
+        return self.rev_channel.get(wire, wire)
+
+    def _normalize_incoming_ids(self, m: Message):
+        """Convierte src/dst de canal -> ID interno en mensajes entrantes."""
+        if self.use_channel_ids_on_wire:
+            if m.src:
+                m.src = self._internal_id(m.src)
+            if m.dst and m.dst != "*":
+                m.dst = self._internal_id(m.dst)
 
     # ---------------- Ciclo de vida ----------------
     def start(self):
@@ -167,7 +194,6 @@ class Node:
                 t.join(timeout=1.0)
         self._redis_close()
         print(f"{CC.GR}[{self.name}] stopped.{CC.RESET}")
-
 
     # ---------------- Transporte: Redis ----------------
     def _redis_connect(self):
@@ -229,6 +255,8 @@ class Node:
                 except Exception as e:
                     print(f"[{self.name}] invalid json: {e}")
                     continue
+                # Normaliza src/dst de canal -> ID interno
+                self._normalize_incoming_ids(m)
                 self.incoming.put(m)
             except Exception:
                 # Re-suscribir en caso de error
@@ -240,6 +268,7 @@ class Node:
 
     # ---------------- Envío ----------------
     def _channel_of(self, dst_node: str) -> str:
+        """Canal del nodo destino (usa IDs internos A/B/C)."""
         return self.channel_by_node.get(dst_node, dst_node)
 
     def send_to_node(self, dst_node: str, m: Message):
@@ -255,7 +284,7 @@ class Node:
     def send_data(self, dst_node: str, payload: Any, hops: int = 16, alg: str = None):
         """
         Enviar dato de usuario.
-        - Broadcast: dst_node == "*" => flooding a todos los vecinos.
+        - Broadcast: dst_node == "*" => flooding a todos los vecinos (to="*").
         - Unicast:
             - LSR/DVR: usa route_table para next-hop; si no hay ruta, fallback a flooding.
             - Flooding: envía a todos los vecinos.
@@ -263,15 +292,19 @@ class Node:
         if alg is None:
             alg = self.algorithm
 
+        wire_src = self._wire_id(self.name)
+
         if dst_node == "*":
-            m = Message.data(src=self.name, dst="*", payload=payload, hops=hops, alg="flooding")
+            m = Message.data(src=wire_src, dst="*", payload=payload, hops=hops, alg="flooding")
             for v in self.neighbor_ids:
                 self.send_to_node(v, m)
             return
 
-        m = Message.data(src=self.name, dst=dst_node, payload=payload, hops=hops, alg=alg)
+        wire_dst = self._wire_id(dst_node)  # destino final en el cable (canal si corresponde)
+        m = Message.data(src=wire_src, dst=wire_dst, payload=payload, hops=hops, alg=alg)
+
         if alg in ("lsr", "dvr"):
-            nh = self.route_table.get(dst_node)
+            nh = self.route_table.get(dst_node)  # next-hop por ID interno
             if nh:
                 self.send_to_node(nh, m)
             else:
@@ -287,7 +320,7 @@ class Node:
     # ---------------- Utilidades/Comandos ----------------
     def send_hello(self, dst: str, hops: int = 4):
         """PING: envía HELLO a un vecino específico para medir RTT con el ECHO."""
-        h = Message.hello(src=self.name, dst=dst, hops=hops, alg="flooding")
+        h = Message.hello(src=self._wire_id(self.name), dst=self._wire_id(dst), hops=hops, alg="flooding")
         self.neigh_last_hello[dst] = time.time()
         self.send_to_node(dst, h)
 
@@ -300,7 +333,7 @@ class Node:
         while self.running:
             now = time.time()
             for v in self.neighbor_ids:
-                h = Message.hello(src=self.name, dst=v, hops=4, alg="flooding")
+                h = Message.hello(src=self._wire_id(self.name), dst=self._wire_id(v), hops=4, alg="flooding")
                 self.neigh_last_hello[v] = now
                 self.send_to_node(v, h)
             time.sleep(2.0)  # periodo HELLO
@@ -312,8 +345,7 @@ class Node:
                 self._recompute_routes()
             elif self.algorithm == "dvr":
                 self._emit_info_dvr()
-                # La recomputación DV ocurre al recibir anuncios o cambiar enlaces,
-                # pero podríamos refrescar la tabla igual:
+                # tabla DV ya se refresca al recibir; aquí solo reflejamos por si acaso
                 self.route_table = self.dvr.get_routing_table()
             # flooding no requiere cómputo periódico
             time.sleep(3.0)
@@ -362,7 +394,7 @@ class Node:
                 continue
 
             try:
-                # Control por tipo
+                # (IDs ya normalizados a A/B/C en _recv_loop)
                 if m.type == Message.TYPE_HELLO:
                     self._handle_hello(m)
                     continue
@@ -376,8 +408,8 @@ class Node:
                     continue
 
                 if m.type == Message.TYPE_MESSAGE:
-                    # Entrega local (soporta "*" como broadcast)
-                    if m.is_for_me(self.name):
+                    # Entrega local: acepta "*" o mi ID interno; por compat, también mi canal
+                    if m.dst == "*" or m.dst == self.name or m.dst == self.channel:
                         self._deliver(m)
                         continue
 
@@ -395,7 +427,9 @@ class Node:
 
                     # Reenvío
                     if m.alg() in ("lsr", "dvr"):
-                        nh = self.route_table.get(m.dst)
+                        # m.dst puede venir como canal de destino; conviértelo a ID interno si aplica
+                        dst_internal = self._internal_id(m.dst)
+                        nh = self.route_table.get(dst_internal)
                         if nh:
                             self.send_to_node(nh, m)
                         else:
@@ -410,9 +444,9 @@ class Node:
 
     # ---------------- Handlers ----------------
     def _handle_hello(self, m: Message):
-        # Responder ECHO conservando algoritmo
-        e = Message.echo(src=self.name, dst=m.src, hops=4, alg=m.alg())
-        self.send_to_node(m.src, e)
+        # Responder ECHO conservando algoritmo (IDs en el cable como canales si corresponde)
+        e = Message.echo(src=self._wire_id(self.name), dst=self._wire_id(m.src), hops=4, alg=m.alg())
+        self.send_to_node(m.src, e)  # aquí m.src ya es ID interno; publish por su canal
 
     def _handle_echo(self, m: Message):
         now = time.time()
@@ -423,23 +457,47 @@ class Node:
     def _emit_info_lsr(self, only_to: Optional[str] = None):
         """Emite LSP (INFO) con mis vecinos y pesos locales. Si only_to se da, se envía solo allí."""
         self.lsr_seq += 1
-        neighbors = {v: float(self.link_costs.get(v, 1.0)) for v in self.neighbor_ids}
-        lsp = Message.info_lsr(src=self.name, seq_num=self.lsr_seq, neighbors=neighbors, hops=16, alg="lsr")
+        # vecinos con claves "en el cable" (canales) si corresponde
+        neighbors_wire: Dict[str, float] = {}
+        for v in self.neighbor_ids:
+            neighbors_wire[self._wire_id(v)] = float(self.link_costs.get(v, 1.0))
+
         targets = [only_to] if only_to else self.neighbor_ids
         for v in targets:
-            if v:
-                self.send_to_node(v, lsp)
+            if not v:
+                continue
+            # 🚫 sin dst=..., porque tu Message.info_lsr no lo acepta
+            lsp = Message.info_lsr(
+                src=self._wire_id(self.name),
+                seq_num=self.lsr_seq,
+                neighbors=neighbors_wire,
+                hops=16,
+                alg="lsr",
+            )
+            # ✅ si quieres que el JSON “en el cable” también tenga "to", puedes setearlo después:
+            lsp.dst = self._wire_id(v)   # opcional; si no lo pones, igual solo lo recibe ese vecino por el canal
+            self.send_to_node(v, lsp)
+
 
     def _emit_info_dvr(self):
         """Emite vector de distancias (INFO alg='dvr') a cada vecino (split-horizon por-vecino)."""
-        self.dvr_seq += 1  # opcional
+        self.dvr_seq += 1
         for v in self.neighbor_ids:
-            vec = self.dvr.announce_for(v)  # aplica split-horizon/poison-reverse
-            msg = Message.info_lsr(src=self.name, seq_num=self.dvr_seq, neighbors=vec, hops=16, alg="dvr")
+            vec = self.dvr.announce_for(v)  # split-horizon/poison-reverse
+            vec_wire = {self._wire_id(d): dist for d, dist in (vec or {}).items()}
+            msg = Message.info_lsr(
+                src=self._wire_id(self.name),
+                seq_num=self.dvr_seq,
+                neighbors=vec_wire,
+                hops=16,
+                alg="dvr",
+            )
+            msg.dst = self._wire_id(v)   # opcional
             self.send_to_node(v, msg)
 
+
     def _handle_info(self, m: Message):
-        """Procesa INFO: LSR (LSP) o DVR (vector)."""
+        """Procesa INFO: LSR (LSP) o DVR (vector).  (m.src/m.dst ya son IDs internos por normalización)"""
         alg = m.alg()
         if alg == "lsr":
             key = (m.src, alg, int(m.seq_num or 0))
@@ -451,12 +509,23 @@ class Node:
             u = m.src
             self.graph.setdefault(u, {})
             self.graph[u] = {}
-            for v, cost in (m.neighbors or {}).items():
-                c = float(cost)
-                self.graph[u][v] = c
-                self.graph.setdefault(v, {})
-                # No dirigido: reflejamos el costo en ambos sentidos (opcional)
-                self.graph[v].setdefault(u, c)
+
+            # neighbors puede venir como lista (peso=1.0) o dict {canal/ID: costo}
+            neigh_obj = m.neighbors or {}
+            if isinstance(neigh_obj, list):
+                for w in neigh_obj:
+                    v = self._internal_id(str(w))
+                    c = float(self.link_costs.get(v, 1.0))
+                    self.graph[u][v] = c
+                    self.graph.setdefault(v, {})
+                    self.graph[v].setdefault(u, c)
+            else:
+                for w, cost in neigh_obj.items():
+                    v = self._internal_id(str(w))
+                    c = float(cost)
+                    self.graph[u][v] = c
+                    self.graph.setdefault(v, {})
+                    self.graph[v].setdefault(u, c)
 
             # Repropagar si queda TTL (LSR propaga LSPs)
             m.dec_hops()
@@ -469,10 +538,11 @@ class Node:
             return
 
         if alg == "dvr":
-            # DV no repropaga el paquete recibido; procesa y, si hay cambios, anunciará lo propio
+            # DV no repropaga; procesa vector recibido
             vec = m.neighbors or {}
-            # registrar "visto" no es necesario en DV, usamos triggered updates
-            self.dvr.receive_announcement(m.src, vec)
+            # Convierte claves canal->ID interno
+            vec_internal = {self._internal_id(str(d)): float(dist) for d, dist in vec.items()}
+            self.dvr.receive_announcement(m.src, vec_internal)
             self.route_table = self.dvr.get_routing_table()
             return
 
@@ -499,9 +569,7 @@ class Node:
 
     # ---------------- Entrega local ----------------
     def _deliver(self, m):
-        # Versión compatible: si no tienes la clase de colores CC, cae al print simple
         try:
             print(f"{CC.C}📬 [{self.name}] DATA de {m.src or '?'} -> {m.dst}: {m.payload}{CC.RESET}")
         except NameError:
             print(f"[{self.name}] DATA de {m.src} -> {m.dst}: {m.payload}")
-
