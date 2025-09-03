@@ -1,136 +1,228 @@
-# Routing Lab Prototype (Python)
-Prototipo completo con **múltiples algoritmos de enrutamiento** y **métricas automáticas**:
-- **Dijkstra (LSR)** en `router/dijkstra.py`
-- **Bellman-Ford (DVR)** en `router/dvr.py`
-- **Sistema de métricas automáticas** en `router/metrics.py`
-- **Infraestructura de sockets UDP** + **hilos** con separación **Forwarding** y **Routing**
-- **Sistema de mensajes JSON** con soporte para múltiples protocolos
-- **Comparación LSR vs DVR** con análisis de rendimiento en tiempo real
+# Redes Lab 3 — Algoritmos de Enrutamiento (Parte 2)
 
-> **Estado:** ✅ **COMPLETADO** - Implementación funcional de LSR y DVR con métricas automáticas.
+> **Proyecto base del Grupo (Sec10) para Flooding, DVR y LSR sobre Redis**  
+> Última actualización: 2025-09-03
 
-## Requisitos
-- Python 3.10+
-- No dependencias externas
+Este repositorio implementa un **nodo de ruteo** con un shell interactivo y soporte para tres algoritmos:
+- **Flooding** (difusión)
+- **DVR** (*Distance Vector Routing*)
+- **LSR** (*Link-State Routing* con Dijkstra)
 
-## Cómo probar
+El transporte por defecto es **Redis (pub/sub)**; también hay compatibilidad con **UDP** (según configuración). El proyecto está pensado para **interoperar** con otros equipos, usando un **formato de mensaje JSON común**, y para ejecutar **pruebas de topologías** como línea, anillo y árbol/estrella.
 
-### Demo básico con métricas (LSR + DVR mixto)
-```bash
-python run_demo.py
+---
+
+## 🧩 Estructura del proyecto
+
 ```
-- Nodos A, B: LSR (Dijkstra)
-- Nodos C, D: DVR (Bellman-Ford)
-- **Métricas automáticas** al finalizar (Ctrl+C)
-- Genera reporte JSON con estadísticas
-
-### Comparación completa con análisis
-```bash
-python compare_protocols.py
-```
-- Ejecuta LSR y DVR por separado
-- **Métricas automáticas** de rendimiento
-- Compara tiempo de convergencia, overhead, tablas de enrutamiento
-- Genera reporte JSON detallado
-
-### Prueba rápida del sistema
-```bash
-python test_metrics.py
-```
-- Prueba rápida con 2 nodos
-- Verifica que las métricas funcionen correctamente
-- Ideal para debugging
-
-## Estructura
-```
-routing_lab_proto/
-  router/
-    __init__.py
-    message.py          # Sistema de mensajes + constantes
-    dijkstra.py         # Algoritmo de Dijkstra (LSR)
-    dvr.py             # Algoritmo de Bellman-Ford (DVR)
-    metrics.py         # Sistema de métricas automáticas
-    node.py            # Nodo con soporte multi-protocolo
-  topo-sample.json     # Topología de ejemplo
-  names-sample.json    # Configuración de nodos
-  run_demo.py          # Demo mixto LSR/DVR con métricas
-  compare_protocols.py # Comparador completo con análisis
-  test_metrics.py      # Prueba rápida del sistema
-  README.md
+Redes_Lab3/
+├── run_demo.py               # CLI para levantar nodos (shell o envío 'one-shot')
+├── router/
+│   ├── node.py               # Lógica del nodo: listener, forwarding, routing loops
+│   ├── message.py            # Clase Message y serialización JSON
+│   ├── dijkstra.py           # Cálculo de rutas para LSR
+│   └── ...                   # utilidades y helpers
+├── names-*.json              # Mapa lógico → canal (Redis)
+├── topo-*.json               # Definición de vecindad (topologías)
+└── README_Redes_Lab3.md      # Este documento
 ```
 
-## Protocolos Implementados
+---
 
-### 1. LSR (Link State Routing) - Dijkstra
-- **Convergencia:** Rápida (O(V²))
-- **Overhead:** Moderado (LSP flooding)
-- **Escalabilidad:** Buena para redes medianas
-- **Implementación:** `router/dijkstra.py`
+## 🔐 Protocolo de mensaje (interoperabilidad)
 
-### 2. DVR (Distance Vector Routing) - Bellman-Ford
-- **Convergencia:** Más lenta (O(V×E))
-- **Overhead:** Menor (anuncios de distancia)
-- **Escalabilidad:** Limitada (count-to-infinity)
-- **Implementación:** `router/dvr.py`
+El proyecto usa un **JSON** tolerante (diccionario o lista de headers) para interoperar con otros grupos. Campos:
 
-### 3. Flooding
-- **Convergencia:** Inmediata
-- **Overhead:** Alto (envío a todos)
-- **Escalabilidad:** Limitada
-- **Implementación:** Integrado en `node.py`
-
-## Mensajes (JSON)
-```json
+```jsonc
 {
-  "proto": "lsr|dvr|flooding|sys",
-  "type": "hello|lsp|data|echo|info|dv_announcement",
-  "from": "A",
-  "to": "D",
-  "ttl": 8,
-  "headers": {},
-  "payload": {}
+  "type": "hello|message|info|echo",
+  "from": "sec10.grupoX.alumno",    // emisor lógico
+  "to":   "sec10.grupoY.alumno",    // destino lógico
+  "hops": 0,                        // contador de saltos
+  "headers": [
+    { "alg": "lsr|dvr|flooding" },  // algoritmo activo
+    { "ttl": 8 },                   // tiempo de vida
+    { "id":  "uuid-o-hash" }        // control de duplicados
+  ],
+  "seq_num":  0,                    // SOLO en type=info (LSR)
+  "neighbors": { "B": 1.0 },        // SOLO en type=info (LSR)
+  "payload": "texto o {{...}}"      // SOLO en type=message
 }
 ```
 
-## Características Técnicas
+> **Notas**  
+> - `info` (LSR) anuncia `neighbors` y `seq_num`.  
+> - `message` lleva `payload`.  
+> - `hello/echo` se usan para salud y RTT.  
+> - Compatibilidad: si `headers` llega como lista o dict, el nodo lo normaliza; `ttl` y `hops` se mantienen sincronizados.
 
-### ✅ Implementado
-- **Multi-protocolo:** LSR, DVR, Flooding
-- **Métricas automáticas** de rendimiento
-- **Sockets UDP** con threading
-- **Separación Forwarding/Routing**
-- **TTL** para evitar loops
-- **Hello/Echo** para RTT
-- **Supresión de duplicados**
-- **Comparación automática** de protocolos
-- **Reportes JSON** detallados
+---
 
-### 🔧 Configuración
-```python
-# Crear nodo con protocolo específico
-node = Node(
-    name="A",
-    bind_host="127.0.0.1",
-    bind_port=56001,
-    names=names,
-    neighbors=["B", "C"],
-    routing_protocol="dvr"  # "lsr" o "dvr"
-)
+## 🧰 Requisitos
+
+- Python 3.10+ (probado con 3.11/3.12/3.13)
+- Paquete `redis` (`pip install redis`)
+- Acceso a un servidor Redis
+  - **Lab**: `lab3.redesuvg.cloud:6379` (usuario `default`, pass `UVGRedis2025`)  
+  - **Local** (opcional): `redis-server` en tu máquina
+
+---
+
+## ⚙️ Archivos de configuración
+
+### `names-redis.json`
+Mapea cada **nombre lógico** a un **canal Redis** (formato `sec10.grupoX.usuario`). Ejemplo:
+
+```json
+{
+  "A": { "channel": "sec10.grupo7.Jorge" },
+  "B": { "channel": "sec10.grupo7.diederich" },
+  "C": { "channel": "sec10.grupo7.angel" },
+  "D": { "channel": "sec10.grupo7.D" },
+  "E": { "channel": "sec10.grupo7.E" },
+  "F": { "channel": "sec10.grupo7.F" },
+  "G": { "channel": "sec10.grupo7.G" }
+}
 ```
 
-## Experimentos Sugeridos
+### `topo-*.json`
+Define la **vecindad** (grafo no dirigido). Ejemplo de **anillo** A–B–C–D–E–F–G–A:
 
-1. **Cambiar protocolos dinámicamente**
-2. **Simular fallos de enlaces**
-3. **Medir tiempo de convergencia**
-4. **Comparar overhead de mensajes**
-5. **Escalar a más nodos**
+```json
+{
+  "A": ["B","G"],
+  "B": ["A","C"],
+  "C": ["B","D"],
+  "D": ["C","E"],
+  "E": ["D","F"],
+  "F": ["E","G"],
+  "G": ["F","A"]
+}
+```
 
-## Resultados Esperados
+---
 
-- **LSR:** Convergencia rápida, rutas óptimas
-- **DVR:** Convergencia más lenta, mismas rutas finales
-- **Ambos:** Deberían converger a las mismas rutas óptimas
-- **Flooding:** Entrega garantizada pero con alto overhead
+## 🚀 Cómo ejecutar
 
+> En **zsh** usa una sola línea (evita `\` al final con espacios).  
+> En cada caso abre **una terminal por nodo**.
 
+### Modo interactivo (shell)
+
+**LSR (recomendado para rutas mínimas):**
+
+```bash
+python3 run_demo.py --names names-redis.json --topo topo-anillo-7.json \
+  --transport redis --alg lsr --src A --shell \
+  --redis-host lab3.redesuvg.cloud --redis-port 6379 \
+  --redis-user default --redis-pass UVGRedis2025
+# Repite para B..G cambiando --src
+```
+
+**Flooding (difusión):**
+
+```bash
+python3 run_demo.py --names names-redis.json --topo topo-linea-5.json \
+  --transport redis --alg flooding --src A --shell \
+  --redis-host lab3.redesuvg.cloud --redis-port 6379 \
+  --redis-user default --redis-pass UVGRedis2025
+# Repite para B..E
+```
+
+**DVR (vector distancia):**
+
+```bash
+python3 run_demo.py --names names-redis.json --topo topo-linea-3.json \
+  --transport redis --alg dvr --src A --shell \
+  --redis-host lab3.redesuvg.cloud --redis-port 6379 \
+  --redis-user default --redis-pass UVGRedis2025
+# Repite para B y C
+```
+
+### Envío “one‑shot” (sin shell)
+
+```bash
+python3 run_demo.py --names names-redis.json --topo topo-anillo-7.json \
+  --transport redis --alg lsr --src A \
+  --send "F:Hola desde A (LSR)!" \
+  --redis-host lab3.redesuvg.cloud --redis-port 6379 \
+  --redis-user default --redis-pass UVGRedis2025
+```
+
+---
+
+## 🖥️ Comandos del shell
+
+- `send <dst> "<texto>"` — Unicast respetando el algoritmo activo.
+- `broadcast <texto>` — Difusión por Flooding.
+- `ping <vecino>` — Mide RTT con HELLO/ECHO.
+- `info <vecino>` — Envía HELLO/INFO (según alg) a un vecino.
+- `show routes` — Tabla de ruteo (LSR/DVR).
+- `show neighbors` — Estado de vecinos (UP/DOWN, último ECHO ms).
+- `show lsdb` — Base de enlaces (LSR).
+- `show dv` — Vector distancia (DVR).
+- `nodes` — Nodos conocidos y canales.
+- `exit` — Salir del shell.
+
+> **Tip:** espera ~3–5 s para que intercambien `INFO/HELLO` antes de `send` o `show routes` (convergencia).
+
+---
+
+## 🔎 Escenarios de prueba sugeridos
+
+### 1) Línea (Flooding) — A–B–C–D–E
+- `send E "hola"` desde A → **entregado**.
+- Apaga **C** → repetir `send E` → **no entregado** (sin “saltos”).
+
+### 2) Anillo (LSR) — A–B–C–D–E–F–G–A
+- Ruta A→F debe ir por **G** (camino corto).  
+- Apaga **G** → `show routes` en A ahora indica **B** como siguiente salto; `send F` se entrega por el otro lado (B–C–D–E).
+
+### 3) Línea (DVR) — A–B–C
+- Ver `show dv`/`show routes` hasta converger.  
+- Enviar A→C. Apagar **B** → A pierde alcance a C hasta que se recupere B.
+
+---
+
+## 🧠 Detalles de implementación
+
+- **Flooding:** reenvío a todos los vecinos con control de duplicados (`headers.id`) y `ttl/hops` decreciente.
+- **LSR:** cada nodo difunde `info` con `{{seq_num, neighbors}}`; la LSDB se mantiene por el último `seq_num` por emisor y se corre **Dijkstra** para obtener `next-hop`.
+- **DVR:** intercambio periódico de vectores; actualización por **Bellman‑Ford** hop‑by‑hop; invalidación de rutas ante timeout de vecino.
+- **Compatibilidad de headers:** si llega `headers` como lista/dict, se normaliza. Se sincroniza `ttl`↔`hops` y se infiere `alg` cuando falta (info→`lsr`).
+
+---
+
+## 🧯 Troubleshooting
+
+- **`max number of clients reached`**  
+  El Redis del lab está lleno. Usa **Redis local** y cambia `--redis-host/--redis-port` a tu IP/puerto local.
+
+- **No se entrega `send` en LSR/DVR**  
+  Verifica que exista **ruta** (`show routes`). Si no hay `next-hop`, el nodo no envía unicast (diseño). Espera convergencia o revisa la topología.
+
+- **Zsh: `--transport` “no se reconoce”**  
+  Sucede por partir el comando en varias líneas con `\` mal puesto. Usa **una sola línea**.
+
+- **Paths de topo/names**  
+  Usa rutas absolutas si aparece `FileNotFoundError`.
+
+---
+
+## 📜 Licencia y créditos
+
+Trabajo académico del curso de Redes (Sección 10). Uso educativo. Creditos a los integrantes del equipo y a los grupos con quienes se realizaron pruebas de interoperabilidad.
+
+---
+
+## ✅ Checklist rápido para demos
+
+- [ ] `names-redis.json` con canales reales `sec10.…`  
+- [ ] `topo-*.json` consistente en todos los nodos  
+- [ ] Redis accesible (lab o local)  
+- [ ] Lanzar todos los nodos (una terminal por nodo)  
+- [ ] Esperar 3–5 s de warmup  
+- [ ] `show neighbors`, `show routes`  
+- [ ] `send <dst> "mensaje"` y captura de evidencia
+
+¡Listo para demo! 🚀

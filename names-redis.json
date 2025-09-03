@@ -1,9 +1,10 @@
+
 {
-  "A": {
-    "channel": "sec10.group7.Jorge "
-  },
-  "B": {
-    "channel": "sec10.group7.diederich"
-  }
-  
+  "A": { "channel": "sec10.group7.Jorge" },
+  "B": { "channel": "sec10.group7.diederich" },
+  "C": { "channel": "sec10.grupo7.angel" },
+  "D": { "channel": "sec10.grupo7.D" },
+  "E": { "channel": "sec10.grupo7.E" },
+  "F": { "channel": "sec10.grupo7.F" },
+  "G": { "channel": "sec10.grupo7.G" }
 }
